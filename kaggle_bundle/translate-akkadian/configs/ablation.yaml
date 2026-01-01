@@ -1,0 +1,8 @@
+# マイルストーン2のアブレーション設定
+data_dir: data
+artifacts_dir: artifacts
+aligned_path: artifacts/aligned/aligned_train.parquet
+k_folds: 5
+seed: 42
+variants: A,B,C
+ablation_format: parquet

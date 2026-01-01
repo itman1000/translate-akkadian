@@ -1,0 +1,7 @@
+# マイルストーン0の最小設定
+experiment_name: baseline_dummy
+data_dir: data
+artifacts_dir: artifacts
+seed: 42
+dummy_strategy: constant
+dummy_translation: Translation unavailable.

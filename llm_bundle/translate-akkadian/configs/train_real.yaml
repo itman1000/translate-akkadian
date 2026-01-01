@@ -1,0 +1,7 @@
+# TF-IDF retrieval baseline config
+experiment_name: tfidf_char
+ngram_min: 3
+ngram_max: 5
+min_df: 2
+max_df: 0.9
+max_features: 50000

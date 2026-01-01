@@ -1,0 +1,9 @@
+# TF-IDF retrieval baseline (word 1-2)
+experiment_name: tfidf_word_1_2
+analyzer: word
+ngram_min: 1
+ngram_max: 2
+min_df: 1
+max_df: 0.95
+max_features: 50000
+token_pattern: '(?u)\b\w+\b'

@@ -1,0 +1,58 @@
+"""予測から submission.csv を作成する。"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+from .utils import clean_text, get_data_dir, load_config
+
+
+def load_predictions(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if len(df.columns) == 1 and df.columns[0] not in {"id", "translation"}:
+        df = pd.read_csv(path, header=None, names=["translation"])
+    return df
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build submission.csv.")
+    parser.add_argument("--pred", required=True, help="Predictions CSV path.")
+    parser.add_argument("--out", required=True, help="Output submission CSV path.")
+    parser.add_argument("--config", default=None, help="Optional config path.")
+    parser.add_argument("--data-dir", default=None, help="Data directory path.")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config) if args.config else {}
+    pred_path = Path(args.pred)
+    if not pred_path.exists():
+        raise FileNotFoundError(f"Predictions not found: {pred_path}")
+
+    pred_df = load_predictions(pred_path)
+
+    if "translation" not in pred_df.columns:
+        raise ValueError("Predictions must include a 'translation' column")
+
+    if "id" not in pred_df.columns:
+        data_dir = get_data_dir(cfg, args.data_dir)
+        test_path = data_dir / "test.csv"
+        if not test_path.exists():
+            raise FileNotFoundError(f"test.csv not found at: {test_path}")
+        test_df = pd.read_csv(test_path)
+        if len(test_df) != len(pred_df):
+            raise ValueError("Predictions row count does not match test.csv")
+        pred_df.insert(0, "id", test_df["id"].values)
+
+    pred_df["translation"] = pred_df["translation"].astype(str).map(clean_text)
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pred_df[["id", "translation"]].to_csv(out_path, index=False)
+
+    print(f"Saved submission: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
