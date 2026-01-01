@@ -22,12 +22,18 @@ save_total_limit: 1
 predict_with_generate: true
 generation_max_length: 320
 generation_max_new_tokens: 320
-infer_generation_max_new_tokens: 256  # 推論時のみ上限を下げたい場合に使用 (dp.infer_nmt)
 num_beams: 2
 length_penalty: 0.8
 early_stopping: true
 no_repeat_ngram_size: 20
 repetition_penalty: 1.15
+
+# Submission safety / postprocess
+force_single_sentence: true
+single_sentence_mode: merge  # merge | truncate
+
+# Decode preset for infer_nmt (train_nmt always uses the values above)
+decode_preset: cfg
 fp16: false
 gradient_checkpointing: false
 dropout_rate: 0.1

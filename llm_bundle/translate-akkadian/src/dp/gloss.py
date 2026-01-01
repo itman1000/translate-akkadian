@@ -49,6 +49,9 @@ DEFAULT_STOP_LEMMAS: Tuple[str, ...] = (
     "mā",
     "kīma",  # like, as
     "kima",
+    # Very frequent negation; tends to over-trigger templatic English outputs.
+    "lā",  # not, no; without
+    "la",  # fallback (ASCII)
 )
 
 

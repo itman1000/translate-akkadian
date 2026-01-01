@@ -21,6 +21,7 @@ from .gloss import (
 )
 from .utils import (
     clean_text,
+    count_sentence_endings,
     enforce_single_sentence,
     get_artifacts_dir,
     get_data_dir,
@@ -99,7 +100,6 @@ def log_text_summary(df: pd.DataFrame, col: str, label: str) -> None:
 _GAP_TAG_RE = re.compile(r"<\s*gap\s*>", re.IGNORECASE)
 _BIG_GAP_TAG_RE = re.compile(r"<\s*big_gap\s*>", re.IGNORECASE)
 _DET_RE = re.compile(r"\{[^}]+\}|\([^)]*\)")
-_PUNCT_RE = re.compile(r"[.!?]")
 
 
 def batch_iter(items: List[str], batch_size: int) -> Iterable[List[str]]:
@@ -281,7 +281,7 @@ def log_invariant_rates(
     pred_gap = [has_gap(text) for text in pred_texts]
     gap_mismatch = [(r != p) for r, p in zip(ref_gap, pred_gap)]
     pred_det = [has_determinative(text) for text in pred_texts]
-    pred_punct = [len(_PUNCT_RE.findall(text)) for text in pred_texts]
+    pred_punct = [count_sentence_endings(text) for text in pred_texts]
 
     print("=== 不変条件チェック ===")
     print(

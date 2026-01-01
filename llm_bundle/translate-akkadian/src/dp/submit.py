@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .utils import clean_text, get_data_dir, load_config
+from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config
 
 
 def load_predictions(path: Path) -> pd.DataFrame:
@@ -45,7 +45,15 @@ def main() -> None:
             raise ValueError("Predictions row count does not match test.csv")
         pred_df.insert(0, "id", test_df["id"].values)
 
-    pred_df["translation"] = pred_df["translation"].astype(str).map(clean_text)
+    # Submission safety: force single-sentence output (decimals like '3.5' are preserved).
+    force_one = bool(cfg.get("force_single_sentence", True))
+    mode = str(cfg.get("single_sentence_mode", "merge")).strip().lower()
+    if force_one:
+        pred_df["translation"] = pred_df["translation"].astype(str).map(
+            lambda s: enforce_single_sentence(s, mode=mode)
+        )
+    else:
+        pred_df["translation"] = pred_df["translation"].astype(str).map(clean_text)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

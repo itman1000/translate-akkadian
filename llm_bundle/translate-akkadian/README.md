@@ -388,7 +388,7 @@ gloss_max_total_chars: 220
 gloss_max_match_len: 4
 gloss_max_lemma_freq: 50
 # gloss_match_types: [word]
-# gloss_stop_lemmas: [ana, ina, ša, u, mā, kīma]
+# gloss_stop_lemmas: [ana, ina, ša, u, mā, kīma, lā]
 # gloss_min_lemma_chars: 2
 # oa_lexicon_path: data/OA_Lexicon_eBL.csv
 # ebl_dictionary_path: data/eBL_Dictionary.csv
@@ -436,6 +436,30 @@ python -m dp.infer_nmt --config configs/nmt_byt5_small.yaml \
   --ckpt artifacts/nmt/byt5_small --test data/test.csv --norm-variant C \
   --out predictions.csv
 ```
+
+#### 1文制約の後処理（推奨）
+コンペ要件（1文）に合わせ、`dp.infer_nmt` と `dp.submit` は **予測文を1文に強制**できます。
+内部の文境界（`. ! ?`）を `;` に置換して **1文に「統合」**する `merge` と、
+最初の文だけを残す `truncate` を選べます。
+
+重要: 小数点（例: `3.5`）は文境界として扱わないため、数値が途中で切れる事故を避けます。
+
+設定（config）:
+```yaml
+force_single_sentence: true
+single_sentence_mode: merge  # merge | truncate
+```
+CLI（推論）:
+- `--no-force-single-sentence` : 無効化
+- `--single-sentence-mode merge|truncate` : モード変更
+
+#### デコードの既定値（beam2_cfg 相当）
+`dp.infer_nmt` のデフォルトは config の `num_beams/length_penalty/no_repeat_ngram_size/repetition_penalty` を使う
+`cfg` プリセットで、`dp.train_nmt` のログに出る **beam2_cfg**（= 設定値を反映した decode）と揃います。
+最低限の config でも事故りにくいよう、推奨値（beams=2 / length_penalty=0.8 / no_repeat=20 / rep_penalty=1.15）をフォールバックします。
+
+必要ならプリセットで比較できます:
+- `--decode-preset cfg|greedy|beam2_free|beam4_free`
 
 4) 提出:
 ```bash

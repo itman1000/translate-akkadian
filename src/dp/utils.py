@@ -203,6 +203,18 @@ def _iter_sentence_end_spans(text: str) -> List[Tuple[int, int, str]]:
     return spans
 
 
+
+def count_sentence_endings(text: str) -> int:
+    """Count likely sentence-ending punctuation spans in text.
+
+    This is used for logging / guardrails.
+    - Ignores decimal points like '3.5'
+    - Ignores a small set of common abbreviations (e.g., 'e.g.')
+    """
+
+    return len(_iter_sentence_end_spans(text))
+
+
 def enforce_single_sentence(text: str, *, mode: str = "merge") -> str:
     """Force a prediction into a single sentence.
 

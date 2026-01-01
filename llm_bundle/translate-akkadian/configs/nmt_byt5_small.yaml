@@ -27,6 +27,13 @@ length_penalty: 0.8
 early_stopping: true
 no_repeat_ngram_size: 20
 repetition_penalty: 1.15
+
+# Submission safety / postprocess
+force_single_sentence: true
+single_sentence_mode: merge  # merge | truncate
+
+# Decode preset for infer_nmt (train_nmt always uses the values above)
+decode_preset: cfg
 fp16: false
 gradient_checkpointing: false
 dropout_rate: 0.1

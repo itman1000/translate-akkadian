@@ -19,7 +19,16 @@ from .gloss import (
     build_gloss_augmenter,
     build_lemma_frequency,
 )
-from .utils import clean_text, get_artifacts_dir, get_data_dir, load_config, now_id, set_seed
+from .utils import (
+    clean_text,
+    count_sentence_endings,
+    enforce_single_sentence,
+    get_artifacts_dir,
+    get_data_dir,
+    load_config,
+    now_id,
+    set_seed,
+)
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -91,7 +100,6 @@ def log_text_summary(df: pd.DataFrame, col: str, label: str) -> None:
 _GAP_TAG_RE = re.compile(r"<\s*gap\s*>", re.IGNORECASE)
 _BIG_GAP_TAG_RE = re.compile(r"<\s*big_gap\s*>", re.IGNORECASE)
 _DET_RE = re.compile(r"\{[^}]+\}|\([^)]*\)")
-_PUNCT_RE = re.compile(r"[.!?]")
 
 
 def batch_iter(items: List[str], batch_size: int) -> Iterable[List[str]]:
@@ -273,7 +281,7 @@ def log_invariant_rates(
     pred_gap = [has_gap(text) for text in pred_texts]
     gap_mismatch = [(r != p) for r, p in zip(ref_gap, pred_gap)]
     pred_det = [has_determinative(text) for text in pred_texts]
-    pred_punct = [len(_PUNCT_RE.findall(text)) for text in pred_texts]
+    pred_punct = [count_sentence_endings(text) for text in pred_texts]
 
     print("=== 不変条件チェック ===")
     print(
@@ -935,15 +943,22 @@ def main() -> None:
     if generation_max_new_tokens is None:
         generation_max_new_tokens = parse_optional_int(cfg.get("max_new_tokens"))
     use_max_new_tokens = generation_max_new_tokens is not None and generation_max_new_tokens > 0
-    num_beams = parse_int(cfg.get("num_beams"), 4)
-    length_penalty = parse_float(cfg.get("length_penalty"), 1.0)
-    no_repeat_ngram_size = parse_int(cfg.get("no_repeat_ngram_size"), 0)
-    repetition_penalty = parse_float(cfg.get("repetition_penalty"), 1.0)
+    # Defaults are tuned to the best-performing 'beam2_cfg' decoding.
+    num_beams = parse_int(cfg.get("num_beams"), 2)
+    length_penalty = parse_float(cfg.get("length_penalty"), 0.8)
+    no_repeat_ngram_size = parse_int(cfg.get("no_repeat_ngram_size"), 20)
+    repetition_penalty = parse_float(cfg.get("repetition_penalty"), 1.15)
     early_stopping = bool(cfg.get("early_stopping", False))
     gen_limit = generation_max_new_tokens if use_max_new_tokens else generation_max_length
     fp16 = bool(cfg.get("fp16", False)) and torch.cuda.is_available()
     bf16 = bool(cfg.get("bf16", False)) and torch.cuda.is_available()
     gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
+
+    # Postprocess: force single-sentence output (submission safety).
+    force_single_sentence = bool(cfg.get("force_single_sentence", True))
+    single_sentence_mode = str(cfg.get("single_sentence_mode", "merge")).strip().lower()
+    if single_sentence_mode not in {"merge", "truncate"}:
+        single_sentence_mode = "merge"
 
     print(
         "=== ハイパーパラメータ ===\n"
@@ -1044,6 +1059,10 @@ def main() -> None:
 
             decoded_preds = [clean_text(text) for text in decoded_preds]
             decoded_labels = [clean_text(text) for text in decoded_labels]
+            if force_single_sentence:
+                decoded_preds = [
+                    enforce_single_sentence(text, mode=single_sentence_mode) for text in decoded_preds
+                ]
             bleu = sacrebleu.corpus_bleu(decoded_preds, [decoded_labels]).score
             chrf = sacrebleu.corpus_chrf(decoded_preds, [decoded_labels], word_order=2).score
             gm = math.sqrt(max(bleu, 0.0) * max(chrf, 0.0))
@@ -1275,6 +1294,11 @@ def main() -> None:
             if val_preds is None:
                 print("[WARN] val_pred decode skipped; downstream logs are skipped")
             else:
+                if force_single_sentence:
+                    val_preds = [
+                        enforce_single_sentence(text, mode=single_sentence_mode)
+                        for text in val_preds
+                    ]
                 # compute_metrics が無効だった場合のフォールバック（環境差対策）
                 if eval_bleu is None or eval_chrf is None or eval_gm is None:
                     fallback = compute_bleu_chrf(val_preds, val_ref_texts)
@@ -1355,6 +1379,12 @@ def main() -> None:
                     if preds is None:
                         print(f"[decode:{name}] skipped (decode failed)")
                         return
+
+                    if force_single_sentence:
+                        preds = [
+                            enforce_single_sentence(text, mode=single_sentence_mode)
+                            for text in preds
+                        ]
 
                     sample_metrics = compute_bleu_chrf(preds, sample_refs)
 

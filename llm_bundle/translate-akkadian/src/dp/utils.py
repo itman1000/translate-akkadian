@@ -9,7 +9,7 @@ import random
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 
 def find_repo_root() -> Path:
@@ -127,11 +127,140 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def first_sentence(text: str) -> str:
-    cleaned = clean_text(text)
-    if not cleaned:
+# Common English abbreviations that may contain '.' but are not sentence boundaries.
+# This is intentionally small/conservative.
+_SENTENCE_ABBREVIATIONS: set[str] = {
+    "e.g",
+    "i.e",
+    "etc",
+    "cf",
+    "vs",
+    "mr",
+    "mrs",
+    "ms",
+    "dr",
+    "prof",
+    "sr",
+    "jr",
+    "st",
+    "no",
+    "fig",
+    "eq",
+    "vol",
+    "pp",
+    "p",
+}
+
+
+def _iter_sentence_end_spans(text: str) -> List[Tuple[int, int, str]]:
+    """Return spans (start_idx, end_idx, punct_char) that likely end sentences.
+
+    Heuristics:
+    - Treat '.', '!', '?' as candidates.
+    - Ignore decimal points like '3.5'.
+    - Collapse runs like '...' into a single span.
+    - Ignore common abbreviations like 'e.g.' / 'Dr.'
+
+    The returned indices are inclusive (end_idx points to the last punctuation char).
+    """
+
+    s = clean_text(text)
+    if not s:
+        return []
+
+    spans: List[Tuple[int, int, str]] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch not in ".!?":
+            i += 1
+            continue
+
+        # Decimal point: digit '.' digit
+        if ch == "." and 0 < i < n - 1 and s[i - 1].isdigit() and s[i + 1].isdigit():
+            i += 1
+            continue
+
+        # Collapse repeated punctuation: '...' / '!!' / '??'
+        j = i
+        while j + 1 < n and s[j + 1] == ch:
+            j += 1
+
+        # Abbreviation guard for '.' (check token immediately before punctuation)
+        if ch == ".":
+            # token = last whitespace-separated chunk before i
+            prev = s[:i].rstrip()
+            token = prev.split()[-1] if prev else ""
+            token = token.rstrip("\"'”’)]}>,")
+            if token.lower() in _SENTENCE_ABBREVIATIONS:
+                i = j + 1
+                continue
+
+        spans.append((i, j, ch))
+        i = j + 1
+
+    return spans
+
+
+
+def count_sentence_endings(text: str) -> int:
+    """Count likely sentence-ending punctuation spans in text.
+
+    This is used for logging / guardrails.
+    - Ignores decimal points like '3.5'
+    - Ignores a small set of common abbreviations (e.g., 'e.g.')
+    """
+
+    return len(_iter_sentence_end_spans(text))
+
+
+def enforce_single_sentence(text: str, *, mode: str = "merge") -> str:
+    """Force a prediction into a single sentence.
+
+    This is a *postprocess* step for Kaggle submission safety.
+
+    Parameters
+    ----------
+    mode:
+      - 'merge': replace internal sentence boundaries with ';' and keep only the last final punctuation.
+      - 'truncate': keep only the first sentence.
+
+    Notes
+    -----
+    - We try to avoid truncating at decimal points (e.g., '3.5').
+    - We intentionally do NOT attempt full sentence segmentation.
+    """
+
+    s = clean_text(text)
+    if not s:
         return ""
-    for match in re.finditer(r"[.!?]", cleaned):
-        end = match.end()
-        return cleaned[:end].strip()
-    return cleaned
+
+    spans = _iter_sentence_end_spans(s)
+    if len(spans) <= 1:
+        return s
+
+    mode_norm = str(mode).strip().lower()
+    if mode_norm not in {"merge", "truncate"}:
+        mode_norm = "merge"
+
+    if mode_norm == "truncate":
+        start, end, _ch = spans[0]
+        out = s[: end + 1].strip()
+        return out
+
+    # merge
+    chars = list(s)
+    for start, end, _ch in spans[:-1]:
+        # Replace the whole punctuation span with a single ';'
+        chars[start : end + 1] = [";"]
+    out = "".join(chars)
+    # normalize spaces around ';'
+    out = re.sub(r"\s*;\s*", "; ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def first_sentence(text: str) -> str:
+    # Backward-compatible helper used by the dummy baseline.
+    return enforce_single_sentence(text, mode="truncate")

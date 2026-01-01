@@ -131,7 +131,8 @@ ByT5-base はメモリ消費が大きいので、OOM の場合は `per_device_tr
 
 ## 7. 変更したいパラメータ
 - Kaggle Notebook では `overrides` 辞書に値を設定してください（`None` は元設定を維持し、上書きがある場合のみ runtime 設定を生成）。
-- 推論設定は `dp.infer_nmt` の `--num-beams`, `--max-target-length`, `--max-new-tokens`, `--length-penalty`, `--early-stopping`, `--no-repeat-ngram-size`, `--repetition-penalty` で調整できます。
+- 推論設定は `dp.infer_nmt` の `--decode-preset`（既定は `cfg`。train_nmt の **beam2_cfg 相当**）、`--num-beams`, `--max-target-length`, `--max-new-tokens`, `--length-penalty`, `--early-stopping`, `--no-repeat-ngram-size`, `--repetition-penalty` で調整できます。
+- 1文制約のための後処理は `dp.infer_nmt --no-force-single-sentence` / `--single-sentence-mode merge|truncate` で調整できます（既定は有効）。
 - 事前学習モデルをローカルパスから使う場合は `MODEL_DIR` を指定してください（Kaggle Datasetとして追加）。
 
 ## 8. Run All と提出の違い

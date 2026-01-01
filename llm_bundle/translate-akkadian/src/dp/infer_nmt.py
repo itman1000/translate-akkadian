@@ -17,7 +17,7 @@ from .gloss import (
     build_gloss_augmenter,
     build_lemma_frequency,
 )
-from .utils import clean_text, get_data_dir, load_config
+from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -95,6 +95,30 @@ def main() -> None:
     parser.add_argument("--src-col", default=None, help="Source column name.")
     parser.add_argument("--id-col", default=None, help="ID column name.")
     parser.add_argument("--norm-variant", default=None, help="Normalize source with A/B/C.")
+
+    # Submission safety: force single-sentence output.
+    parser.add_argument(
+        "--no-force-single-sentence",
+        action="store_true",
+        help="Disable single-sentence postprocess for predictions.",
+    )
+    parser.add_argument(
+        "--single-sentence-mode",
+        default=None,
+        choices=["merge", "truncate"],
+        help="How to force one-sentence output: merge (default) or truncate.",
+    )
+
+    # Decode preset (helpful when config is minimal).
+    parser.add_argument(
+        "--decode-preset",
+        default=None,
+        choices=["cfg", "greedy", "beam2_free", "beam4_free"],
+        help=(
+            "Decoding preset. 'cfg' uses config/CLI values (recommended; matches train_nmt beam2_cfg). "
+            "Other presets override beams/penalties for quick comparison."
+        ),
+    )
 
     # Optional: dictionary gloss hints appended to source text.
     parser.add_argument(
@@ -418,29 +442,54 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    batch_size = args.batch_size or parse_int(cfg.get("infer_batch_size"), 8)
-    max_source_length = args.max_source_length or parse_int(cfg.get("max_source_length"), 256)
-    max_target_length = args.max_target_length or parse_int(cfg.get("generation_max_length"), 256)
+    def _cfg_first(*keys: str, default: Any = None) -> Any:
+        for k in keys:
+            if k in cfg and cfg.get(k) is not None:
+                return cfg.get(k)
+        return default
+
+    batch_size = args.batch_size or parse_int(_cfg_first("infer_batch_size", default=8), 8)
+    max_source_length = args.max_source_length or parse_int(_cfg_first("max_source_length", default=256), 256)
+    max_target_length = args.max_target_length or parse_int(_cfg_first("generation_max_length", "max_target_length", default=256), 256)
     max_new_tokens = args.max_new_tokens
     if max_new_tokens is None:
         raw = cfg.get("generation_max_new_tokens", cfg.get("max_new_tokens"))
         max_new_tokens = parse_optional_int(raw)
     use_max_new_tokens = max_new_tokens is not None and max_new_tokens > 0
     gen_limit = max_new_tokens if use_max_new_tokens else max_target_length
-    num_beams = args.num_beams or parse_int(cfg.get("num_beams"), 4)
+    # Defaults are tuned to the best-performing 'beam2_cfg' decoding from train_nmt.
+    num_beams = args.num_beams or parse_int(_cfg_first("num_beams", "generation_num_beams", default=2), 2)
     length_penalty = args.length_penalty
     if length_penalty is None:
-        raw = cfg.get("length_penalty")
-        length_penalty = float(raw) if raw is not None else 1.0
+        raw = _cfg_first("length_penalty")
+        length_penalty = float(raw) if raw is not None else 0.8
     early_stopping = bool(args.early_stopping or cfg.get("early_stopping", False))
     no_repeat_ngram_size = args.no_repeat_ngram_size
     if no_repeat_ngram_size is None:
-        raw = cfg.get("no_repeat_ngram_size")
-        no_repeat_ngram_size = int(raw) if raw is not None else 0
+        raw = _cfg_first("no_repeat_ngram_size")
+        no_repeat_ngram_size = int(raw) if raw is not None else 20
     repetition_penalty = args.repetition_penalty
     if repetition_penalty is None:
-        raw = cfg.get("repetition_penalty")
-        repetition_penalty = float(raw) if raw is not None else 1.0
+        raw = _cfg_first("repetition_penalty")
+        repetition_penalty = float(raw) if raw is not None else 1.15
+
+    # Optional decode preset override.
+    decode_preset = str(args.decode_preset or _cfg_first("decode_preset", default="cfg")).strip().lower()
+    if decode_preset == "greedy":
+        num_beams = 1
+        length_penalty = 1.0
+        no_repeat_ngram_size = 0
+        repetition_penalty = 1.0
+    elif decode_preset == "beam2_free":
+        num_beams = 2
+        length_penalty = 1.0
+        no_repeat_ngram_size = 0
+        repetition_penalty = 1.0
+    elif decode_preset == "beam4_free":
+        num_beams = 4
+        length_penalty = 1.0
+        no_repeat_ngram_size = 0
+        repetition_penalty = 1.0
 
     print("=== 推論設定 ===")
     print(
@@ -507,7 +556,18 @@ def main() -> None:
                 decoded = tokenizer.batch_decode(safe_outputs, skip_special_tokens=True)
             else:
                 decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            preds.extend([clean_text(text) for text in decoded])
+            preds.extend(decoded)
+
+    # Text postprocess (clean + optional single-sentence enforcement)
+    preds = [clean_text(text) for text in preds]
+    force_one = bool(_cfg_first("force_single_sentence", default=True)) and not bool(args.no_force_single_sentence)
+    one_sent_mode = str(args.single_sentence_mode or _cfg_first("single_sentence_mode", default="merge")).strip().lower()
+    if force_one:
+        preds_pp = [enforce_single_sentence(text, mode=one_sent_mode) for text in preds]
+        changed = sum(int(a != b) for a, b in zip(preds_pp, preds))
+        changed_rate = changed / max(1, len(preds))
+        preds = preds_pp
+        print(f"[postprocess] force_single_sentence=True mode={one_sent_mode} changed={changed_rate:.1%}")
 
     if gen_token_lens:
         series = pd.Series(gen_token_lens)
