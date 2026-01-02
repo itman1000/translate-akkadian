@@ -679,7 +679,7 @@ bash scripts/build_kaggle_bundle.sh
 bash scripts/build_llm_bundle.sh
 ```
 生成先: `llm_bundle/translate-akkadian` と `llm_bundle/translate-akkadian.zip`
-含まれるもの: `src/`, `configs/`, `docs/`, `scripts/`, `tests/`, `submit_kaggle.ipynb`, `README.md`, `README_KAGGLE.md`, `requirements.txt`
+含まれるもの: `src/`, `configs/`, `docs/`, `scripts/`, `tests/`, `submit_kaggle.ipynb`, `README.md`, `README_KAGGLE.md`, `README_COLAB.md`, `requirements.txt`
 
 ## 注意点
 - このマイルストーンはパイプラインの動作確認のみです。ダミーのベースラインは

@@ -1,0 +1,13 @@
+# venv
+.venv/
+venv/
+
+# python
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
+
+# outputs (必要なら)
+tmp/
