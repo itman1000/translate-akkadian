@@ -17,7 +17,7 @@ from .gloss import (
     build_gloss_augmenter,
     build_lemma_frequency,
 )
-from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config
+from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config, normalize_translation_output
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -107,6 +107,16 @@ def main() -> None:
         default=None,
         choices=["merge", "truncate"],
         help="How to force one-sentence output: merge (default) or truncate.",
+    )
+    parser.add_argument(
+        "--normalize-output",
+        action="store_true",
+        help="Enable output normalization (fractions/spacing).",
+    )
+    parser.add_argument(
+        "--no-normalize-output",
+        action="store_true",
+        help="Disable output normalization even if config enables it.",
     )
 
     # Decode preset (helpful when config is minimal).
@@ -558,8 +568,33 @@ def main() -> None:
                 decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
             preds.extend(decoded)
 
-    # Text postprocess (clean + optional single-sentence enforcement)
-    preds = [clean_text(text) for text in preds]
+    # Text postprocess (normalize + optional single-sentence enforcement)
+    normalize_output = bool(cfg.get("normalize_output", False))
+    if args.normalize_output:
+        normalize_output = True
+    if args.no_normalize_output:
+        normalize_output = False
+    normalize_fractions = bool(cfg.get("normalize_output_fractions", True))
+    normalize_units = bool(cfg.get("normalize_output_units", True))
+    if normalize_output:
+        preds_pp = [
+            normalize_translation_output(
+                text,
+                normalize_fractions=normalize_fractions,
+                normalize_units=normalize_units,
+            )
+            for text in preds
+        ]
+        changed = sum(int(a != b) for a, b in zip(preds_pp, preds))
+        changed_rate = changed / max(1, len(preds))
+        preds = preds_pp
+        print(
+            "[postprocess] "
+            f"normalize_output=True changed={changed_rate:.1%} "
+            f"fractions={normalize_fractions} units={normalize_units}"
+        )
+    else:
+        preds = [clean_text(text) for text in preds]
     force_one = bool(_cfg_first("force_single_sentence", default=True)) and not bool(args.no_force_single_sentence)
     one_sent_mode = str(args.single_sentence_mode or _cfg_first("single_sentence_mode", default="merge")).strip().lower()
     if force_one:

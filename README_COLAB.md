@@ -575,6 +575,75 @@ python -m dp.validate   --submission submission.csv   --data-dir "${COMP_DATA_DI
 
 ---
 
+## 3-A. （任意）正規化の効果を val で比較
+`dp.train_nmt` 実行後に `artifacts/nmt/byt5_small_colab/val_doc_ids.json` がある前提です。
+学習時と同じ `TRAIN_PATH` と列名を使って、val 用の入力/正解を作ります。
+
+```python
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+os.chdir("/content/repo/translate-akkadian")
+
+# val の doc id を読み込む
+val_ids = json.loads(Path("artifacts/nmt/byt5_small_colab/val_doc_ids.json").read_text())
+
+# 学習に使ったデータを読み込む
+train_path = os.environ["TRAIN_PATH"]
+if train_path.endswith(".parquet"):
+    df = pd.read_parquet(train_path)
+else:
+    df = pd.read_csv(train_path)
+
+# 学習時の列名に合わせて変更（デフォルトは src_sent / tgt_sent）
+SRC_COL = "src_sent"
+TGT_COL = "tgt_sent"
+
+val_df = df[df["oare_id"].isin(val_ids)].copy().reset_index(drop=True)
+val_df["id"] = range(len(val_df))
+
+Path("artifacts").mkdir(parents=True, exist_ok=True)
+val_df[["id", SRC_COL]].rename(columns={SRC_COL: "transliteration"}).to_csv(
+    "artifacts/val_input.csv",
+    index=False,
+)
+val_df[["id", TGT_COL]].rename(columns={TGT_COL: "translation"}).to_csv(
+    "artifacts/val_gold.csv",
+    index=False,
+)
+print("Saved: artifacts/val_input.csv / artifacts/val_gold.csv")
+```
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# 正規化あり
+python -m dp.infer_nmt \
+  --config "${NMT_CONFIG}" \
+  --ckpt artifacts/nmt/byt5_small_colab \
+  --test artifacts/val_input.csv \
+  --out artifacts/val_pred_norm.csv \
+  --normalize-output
+
+# 正規化なし
+python -m dp.infer_nmt \
+  --config "${NMT_CONFIG}" \
+  --ckpt artifacts/nmt/byt5_small_colab \
+  --test artifacts/val_input.csv \
+  --out artifacts/val_pred_raw.csv \
+  --no-normalize-output
+
+# gm を比較
+python -m dp.eval --pred artifacts/val_pred_norm.csv --gold artifacts/val_gold.csv
+python -m dp.eval --pred artifacts/val_pred_raw.csv --gold artifacts/val_gold.csv
+```
+
+---
+
 ## 4. よくあるトラブルと対処
 
 ### Q1. `train.csv not found` / `test.csv not found`

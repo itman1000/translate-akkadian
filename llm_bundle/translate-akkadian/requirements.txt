@@ -1,8 +1,0 @@
-pandas
-sacrebleu
-pyarrow
-scikit-learn
-torch
-transformers
-datasets
-sentencepiece

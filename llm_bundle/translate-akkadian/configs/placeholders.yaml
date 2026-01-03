@@ -1,9 +1,0 @@
-# Placeholder config for Milestone 3
-data_dir: data
-artifacts_dir: artifacts
-aligned_path: artifacts/aligned/aligned_train.parquet
-lexicon_path: data/OA_Lexicon_eBL.csv
-variants: A,B,C
-placeholder_types: PN,GN
-placeholder_strategy: pattern
-placeholders_format: parquet

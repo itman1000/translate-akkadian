@@ -1,8 +1,0 @@
-# TF-IDF retrieval baseline (char 2-4)
-experiment_name: tfidf_char_2_4
-analyzer: char
-ngram_min: 2
-ngram_max: 4
-min_df: 2
-max_df: 0.9
-max_features: 50000

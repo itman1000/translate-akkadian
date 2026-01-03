@@ -11,3 +11,6 @@ __pycache__/
 
 # outputs (必要なら)
 tmp/
+# local bundles
+kaggle_bundle/
+llm_bundle/

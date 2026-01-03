@@ -37,6 +37,9 @@ repetition_penalty: 1.15
 # 提出の安全策 / 後処理
 force_single_sentence: true
 single_sentence_mode: merge  # 単文化モード: merge | truncate
+normalize_output: true        # 推論出力の表記ゆれを軽く正規化
+normalize_output_fractions: true  # 分数/小数の正規化を有効化
+normalize_output_units: true      # 数値+単位のスペース補正を有効化
 
 # infer_nmt 用デコードプリセット（train_nmt は上記設定を常に使用）
 decode_preset: cfg

@@ -8,6 +8,7 @@ import os
 import random
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -125,6 +126,169 @@ def clean_text(text: str) -> str:
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+# 出力正規化用の簡易ルール
+_DASH_MAP = str.maketrans({"–": "-", "—": "-", "−": "-"})
+_APOSTROPHE_RE = re.compile(r"[’‘ʾʼ]")
+_QUOTE_RE = re.compile(r"[“”„]")
+_FRACTION_SLASH = "\u2044"
+
+_VULGAR_FRACTIONS: dict[str, tuple[int, int]] = {
+    "\u00bc": (1, 4),
+    "\u00bd": (1, 2),
+    "\u00be": (3, 4),
+    "\u2150": (1, 7),
+    "\u2151": (1, 9),
+    "\u2152": (1, 10),
+    "\u2153": (1, 3),
+    "\u2154": (2, 3),
+    "\u2155": (1, 5),
+    "\u2156": (2, 5),
+    "\u2157": (3, 5),
+    "\u2158": (4, 5),
+    "\u2159": (1, 6),
+    "\u215a": (5, 6),
+    "\u215b": (1, 8),
+    "\u215c": (3, 8),
+    "\u215d": (5, 8),
+    "\u215e": (7, 8),
+}
+_VULGAR_FRAC_CHARS = "".join(_VULGAR_FRACTIONS.keys())
+_VULGAR_MIXED_RE = re.compile(rf"(\d+)\s*([{re.escape(_VULGAR_FRAC_CHARS)}])")
+_VULGAR_STANDALONE_RE = re.compile(rf"(?<!\d)([{re.escape(_VULGAR_FRAC_CHARS)}])")
+
+_MIXED_FRAC_RE = re.compile(r"\b(\d+)\s+(\d+)\s*/\s*(\d+)\b")
+_SIMPLE_FRAC_RE = re.compile(r"\b(\d+)\s*/\s*(\d+)\b")
+
+_UNIT_TOKENS = {
+    "mina",
+    "minas",
+    "shekel",
+    "shekels",
+    "talent",
+    "talents",
+    "grain",
+    "grains",
+    "litre",
+    "litres",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "day",
+    "days",
+    "year",
+    "years",
+}
+_UNIT_JOIN_RE = re.compile(
+    rf"(\d+(?:\.\d+)?)(?P<unit>{'|'.join(sorted(_UNIT_TOKENS, key=len, reverse=True))})\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_translation_output(
+    text: str,
+    *,
+    normalize_fractions: bool = True,
+    normalize_units: bool = True,
+) -> str:
+    """翻訳出力の表記ゆれを軽く正規化する。"""
+    if not text:
+        return ""
+    out = str(text)
+    if normalize_fractions:
+        out = _normalize_vulgar_fractions(out)
+    out = unicodedata.normalize("NFKC", out)
+    out = out.translate(_DASH_MAP)
+    out = _APOSTROPHE_RE.sub("'", out)
+    out = _QUOTE_RE.sub('"', out)
+    if normalize_fractions:
+        if _FRACTION_SLASH in out:
+            out = out.replace(_FRACTION_SLASH, "/")
+        out = _normalize_ascii_fractions(out)
+    if normalize_units:
+        out = _normalize_units(out)
+    out = clean_text(out)
+    return out
+
+
+def _fraction_to_decimal(whole: int, num: int, den: int) -> str | None:
+    if den <= 0:
+        return None
+    total = whole * den + num
+    if den == 2:
+        integer = total // 2
+        if total % 2 == 0:
+            return str(integer)
+        return f"{integer}.5"
+    if den == 3:
+        integer = total // 3
+        rem = total % 3
+        if rem == 0:
+            return str(integer)
+        frac = "3333" if rem == 1 else "6666"
+        return f"{integer}.{frac}"
+    if den == 6:
+        integer = total // 6
+        rem = total % 6
+        if rem == 0:
+            return str(integer)
+        if rem == 5:
+            return f"{integer}.83333"
+    return None
+
+
+def _format_fraction(whole: int, num: int, den: int) -> str:
+    dec = _fraction_to_decimal(whole, num, den)
+    if dec is not None:
+        return dec
+    if whole > 0:
+        return f"{whole} {num} / {den}"
+    return f"{num} / {den}"
+
+
+def _normalize_vulgar_fractions(text: str) -> str:
+    def _mixed_repl(match: re.Match[str]) -> str:
+        whole = int(match.group(1))
+        frac = match.group(2)
+        num, den = _VULGAR_FRACTIONS[frac]
+        return _format_fraction(whole, num, den)
+
+    def _standalone_repl(match: re.Match[str]) -> str:
+        frac = match.group(1)
+        num, den = _VULGAR_FRACTIONS[frac]
+        return _format_fraction(0, num, den)
+
+    out = _VULGAR_MIXED_RE.sub(_mixed_repl, text)
+    out = _VULGAR_STANDALONE_RE.sub(_standalone_repl, out)
+    return out
+
+
+def _normalize_ascii_fractions(text: str) -> str:
+    def _mixed_repl(match: re.Match[str]) -> str:
+        whole = int(match.group(1))
+        num = int(match.group(2))
+        den = int(match.group(3))
+        return _format_fraction(whole, num, den)
+
+    def _simple_repl(match: re.Match[str]) -> str:
+        num = int(match.group(1))
+        den = int(match.group(2))
+        return _format_fraction(0, num, den)
+
+    out = _MIXED_FRAC_RE.sub(_mixed_repl, text)
+    out = _SIMPLE_FRAC_RE.sub(_simple_repl, out)
+    return out
+
+
+def _normalize_units(text: str) -> str:
+    def _unit_repl(match: re.Match[str]) -> str:
+        num = match.group(1)
+        unit = match.group("unit")
+        return f"{num} {unit}"
+
+    return _UNIT_JOIN_RE.sub(_unit_repl, text)
 
 
 # Common English abbreviations that may contain '.' but are not sentence boundaries.

@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config
+from .utils import (
+    clean_text,
+    enforce_single_sentence,
+    get_data_dir,
+    load_config,
+    normalize_translation_output,
+)
 
 
 def load_predictions(path: Path) -> pd.DataFrame:
@@ -48,12 +54,24 @@ def main() -> None:
     # Submission safety: force single-sentence output (decimals like '3.5' are preserved).
     force_one = bool(cfg.get("force_single_sentence", True))
     mode = str(cfg.get("single_sentence_mode", "merge")).strip().lower()
-    if force_one:
-        pred_df["translation"] = pred_df["translation"].astype(str).map(
-            lambda s: enforce_single_sentence(s, mode=mode)
-        )
-    else:
-        pred_df["translation"] = pred_df["translation"].astype(str).map(clean_text)
+    normalize_output = bool(cfg.get("normalize_output", False))
+    normalize_fractions = bool(cfg.get("normalize_output_fractions", True))
+    normalize_units = bool(cfg.get("normalize_output_units", True))
+
+    def _postprocess(text: str) -> str:
+        if normalize_output:
+            text = normalize_translation_output(
+                text,
+                normalize_fractions=normalize_fractions,
+                normalize_units=normalize_units,
+            )
+        else:
+            text = clean_text(text)
+        if force_one:
+            text = enforce_single_sentence(text, mode=mode)
+        return text
+
+    pred_df["translation"] = pred_df["translation"].astype(str).map(_postprocess)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -55,6 +55,26 @@ python -m dp.validate --submission submission.csv --data-dir data
 python -m dp.eval --pred submission.csv --gold <gold.csv>
 ```
 
+## 推論出力の表記ゆれ正規化
+`dp.infer_nmt` と `dp.submit` では、翻訳出力の表記ゆれを軽く正規化できます。
+主な処理内容:
+- Unicode/NFKC による文字揺れの吸収（全角・分数など）
+- 分数/小数表記の寄せ（例: `½ → 0.5`, `⅓ → 0.3333`, `1/4 → 1 / 4`）
+- 数値と単位の間のスペース補正（例: `1.5mina → 1.5 mina`）
+
+設定（`configs/*.yaml`）:
+- `normalize_output: true/false`
+- `normalize_output_fractions: true/false`
+- `normalize_output_units: true/false`
+
+`dp.infer_nmt` の CLI から上書きする場合:
+```bash
+python -m dp.infer_nmt --config <cfg.yaml> --ckpt <ckpt_dir> --out artifacts/predictions.csv --normalize-output
+# 無効化したい場合:
+python -m dp.infer_nmt --config <cfg.yaml> --ckpt <ckpt_dir> --out artifacts/predictions.csv --no-normalize-output
+```
+実装は `src/dp/utils.py` の `normalize_translation_output` を参照してください。
+
 ## Milestone 1: 文分割＋アライン
 ```bash
 python -m dp.align_train --config configs/align.yaml
