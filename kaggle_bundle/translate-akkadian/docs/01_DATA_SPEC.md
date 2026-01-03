@@ -11,13 +11,21 @@
   - `text_id` : 文書ID（同一文書内で複数文）
   - `line_start`, `line_end` : 文の範囲（文字列型：`1`, `1'`, `1''` 等）
   - `transliteration` : 入力（文レベル）
+- `sample_submission.csv`
+  - `id`, `translation`（提出フォーマット例）
 - `published_texts.csv`（翻訳なし）
   - `oare_id`, `transliteration_orig`, `transliteration`（クリーン版）など
   - 注意：列名にスペースあり（例：`online transcript`）。読み込み時は列名をそのまま扱う
 - `publications.csv`（OCR由来のページテキスト）
   - `pdf_name`, `page`, `page_text`, `has_akkadian`
 - `bibliography.csv`
+- `resources.csv`（関連研究/リソース一覧）
+  - `Authors [separate with ; last name first]`, `Year`, `Title`, `Topics`, `URL`, `Peer-reviewed` など
 - `OA_Lexicon_eBL.csv`（語彙・固有名詞ヒント）
+- `eBL_Dictionary.csv`（語彙辞書）
+  - `word`, `definition`, `derived_from`
+- `Sentences_Oare_FirstWord_LinNum.csv`（文単位メタ）
+  - `display_name`, `text_uuid`, `sentence_uuid`, `translation`, `line_number`, `first_word_*` など
 
 ## 1.1 実データ差分メモ（重要）
 - train の `transliteration` は改行/行番号がほぼ無い。数字は数量の可能性が高く、境界検出に使えない

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -179,7 +180,7 @@ def decode_predictions(pred_output: Any, tokenizer: Any) -> Optional[List[str]]:
         import numpy as np  # type: ignore
 
         def _sanitize_token_ids(token_ids: "np.ndarray") -> "np.ndarray":
-            """Decode 前に tokenizer が扱えない token id を安全に置換する。
+            """デコード前に tokenizer が扱えない token id を安全に置換する。
 
             ByT5Tokenizer は id を ``chr(id - offset)`` の形で復元するため、
             `-100` のような負の値が混ざると `chr()` が例外を投げる。
@@ -413,12 +414,89 @@ def filter_training_args(
 
 
 def split_train_val(
-    df: pd.DataFrame, val_ratio: float, seed: int
+    df: pd.DataFrame,
+    val_ratio: float,
+    seed: int,
+    *,
+    split_unit: str = "row",
+    doc_id_col: str = "oare_id",
+    source_col: str = "source",
+    exclude_sources: Optional[Iterable[str]] = None,
+    holdout_all_sources: bool = True,
 ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """df を train/val に分割する。
+
+    - split_unit="row": 行単位で分割（従来動作）。
+    - split_unit="doc": 文書ID（doc_id_col）単位で分割し、選ばれた文書の全行が val に入る。
+
+    exclude_sources（例: ["ocr"]）は検証候補から除外し、train に残す。
+    split_unit="doc" かつ holdout_all_sources=True の場合は、除外ソースであっても
+    val 文書の行を train から外す（文書リーク防止）。
+    """
+
     if val_ratio <= 0:
-        return df, None
-    val_df = df.sample(frac=val_ratio, random_state=seed)
-    train_df = df.drop(val_df.index).reset_index(drop=True)
+        return df.reset_index(drop=True), None
+
+    split_unit_norm = str(split_unit or "row").strip().lower()
+
+    exclude_set = {
+        str(s).strip().lower()
+        for s in (exclude_sources or [])
+        if s is not None and str(s).strip()
+    }
+
+    if source_col in df.columns and exclude_set:
+        source_series = df[source_col].astype(str).str.strip().str.lower()
+        is_excluded = source_series.isin(exclude_set)
+    else:
+        is_excluded = pd.Series(False, index=df.index)
+
+    candidate_df = df.loc[~is_excluded]
+    if len(candidate_df) == 0:
+        # 検証対象がないため学習のみ
+        return df.reset_index(drop=True), None
+
+    if split_unit_norm in {"doc", "document"}:
+        if doc_id_col not in df.columns:
+            print(f"[val_split][warn] doc_id_col='{doc_id_col}' not found; fallback to row split.")
+        else:
+            docs = (
+                candidate_df[doc_id_col]
+                .dropna()
+                .astype(str)
+                .map(str.strip)
+                .loc[lambda s: s != ""]
+                .unique()
+                .tolist()
+            )
+            docs = sorted(docs)
+            if docs:
+                n_val_docs = max(1, int(len(docs) * float(val_ratio)))
+                rng = random.Random(int(seed))
+                rng.shuffle(docs)
+                val_docs = set(docs[:n_val_docs])
+
+                val_mask = candidate_df[doc_id_col].astype(str).isin(val_docs)
+                val_df = candidate_df.loc[val_mask].copy()
+
+                if holdout_all_sources:
+                    train_mask = ~df[doc_id_col].astype(str).isin(val_docs)
+                    train_df = df.loc[train_mask].copy()
+                else:
+                    train_df = df.drop(val_df.index).copy()
+
+                train_df = train_df.reset_index(drop=True)
+                val_df = val_df.reset_index(drop=True)
+                return train_df, val_df
+
+            print(
+                f"[val_split][warn] no valid doc ids found in col '{doc_id_col}'; fallback to row split."
+            )
+
+    # デフォルト: 行分割
+    val_df = candidate_df.sample(frac=val_ratio, random_state=seed)
+    train_df = df.drop(val_df.index).copy()
+    train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
     return train_df, val_df
 
@@ -457,7 +535,7 @@ def main() -> None:
         ),
     )
 
-    # Optional: dictionary gloss hints appended to source text.
+    # 任意: 辞書グロスのヒントをソース末尾に付与
     parser.add_argument(
         "--use-gloss",
         action="store_true",
@@ -534,7 +612,7 @@ def main() -> None:
     cfg = load_config(args.config)
     data_dir = get_data_dir(cfg, args.data_dir)
 
-    # post-eval controls (default: full for backward compatibility)
+    # 事後評価の制御（後方互換のためデフォルトは full）
     post_eval_mode = (
         args.post_eval_mode
         or str(cfg.get("post_eval_mode", "full")).strip().lower()
@@ -553,6 +631,24 @@ def main() -> None:
     norm_variant = args.norm_variant or cfg.get("norm_variant")
     val_ratio = args.val_ratio if args.val_ratio is not None else parse_float(cfg.get("val_ratio"), 0.0)
     seed = args.seed if args.seed is not None else parse_int(cfg.get("seed"), 42)
+
+    # 検証分割の設定
+    val_split_unit = str(cfg.get("val_split_unit", "row")).strip().lower()
+    val_doc_id_col = str(cfg.get("val_doc_id_col", "oare_id")).strip()
+    val_source_col = str(cfg.get("val_source_col", "source")).strip()
+
+    _ves = cfg.get("val_exclude_sources", ["ocr"])
+    if _ves is None:
+        val_exclude_sources = []
+    elif isinstance(_ves, str):
+        val_exclude_sources = [s.strip() for s in _ves.replace(';', ',').split(',') if s.strip()]
+    else:
+        try:
+            val_exclude_sources = [str(s).strip() for s in _ves if str(s).strip()]
+        except TypeError:
+            val_exclude_sources = [str(_ves).strip()] if str(_ves).strip() else []
+
+    val_holdout_all_sources = bool(cfg.get("val_holdout_all_sources", True))
 
     max_src_chars = cfg.get("max_src_chars")
     max_tgt_chars = cfg.get("max_tgt_chars")
@@ -594,12 +690,42 @@ def main() -> None:
             max_tgt_chars=max_tgt_chars,
         )
     else:
-        train_df, val_df = split_train_val(train_df, val_ratio, seed)
+        train_df, val_df = split_train_val(
+            train_df,
+            val_ratio=val_ratio,
+            seed=seed,
+            split_unit=val_split_unit,
+            doc_id_col=val_doc_id_col,
+            source_col=val_source_col,
+            exclude_sources=val_exclude_sources,
+            holdout_all_sources=val_holdout_all_sources,
+        )
+
+        if val_df is not None:
+            # 再現性のための簡易ログ
+            msg = [
+                f"[val_split] unit={val_split_unit} ratio={val_ratio} seed={seed}",
+                f"doc_id_col={val_doc_id_col!r}",
+            ]
+            if val_source_col in train_df.columns:
+                msg.append(f"source_col={val_source_col!r} exclude_sources={val_exclude_sources}")
+            msg.append(f"train_rows={len(train_df)} val_rows={len(val_df)}")
+            if val_doc_id_col in val_df.columns:
+                msg.append(f"val_docs={val_df[val_doc_id_col].nunique()}")
+            print(' '.join(msg))
 
     if val_df is not None and args.max_val_rows:
         val_df = val_df.head(args.max_val_rows).reset_index(drop=True)
 
-    # Optional: append gloss hints to the source text.
+    # 再現性のために検証文書IDを保存（doc 分割時のみ意味がある）
+    val_doc_ids: Optional[List[str]] = None
+    if val_df is not None and val_doc_id_col in val_df.columns:
+        try:
+            val_doc_ids = sorted(val_df[val_doc_id_col].dropna().astype(str).unique().tolist())
+        except Exception:
+            val_doc_ids = None
+
+    # 任意: ソースにグロスヒントを付与
     gloss_enabled = bool(
         args.use_gloss
         or bool(cfg.get("use_gloss", False))
@@ -611,7 +737,7 @@ def main() -> None:
     gloss_meta: Optional[Dict[str, Any]] = None
 
     if gloss_enabled:
-        # Resolve resource paths.
+        # リソースパスを解決
         def _resolve_optional(path_value: Any, default_name: str) -> Path:
             if path_value is None or str(path_value).strip() == "":
                 return data_dir / default_name
@@ -665,7 +791,7 @@ def main() -> None:
             "eBL_Dictionary.csv",
         )
 
-        # Match types ("word" only by default; can add PN/GN etc if desired)
+        # マッチタイプ（デフォルトは "word" のみ。必要なら PN/GN などを追加）
         match_types_value = (
             args.gloss_match_types
             if args.gloss_match_types is not None
@@ -673,7 +799,7 @@ def main() -> None:
         )
         match_types = _parse_list(match_types_value) or ["word"]
 
-        # Stop lemmas
+        # 除外するレマ
         use_default_stop = not (
             args.gloss_no_default_stop_lemmas
             or _as_bool(cfg.get("gloss_no_default_stop_lemmas", False))
@@ -706,7 +832,7 @@ def main() -> None:
 
         stop_lemmas = _dedupe_keep_order([s for s in stop_lemmas if s.strip()])
 
-        # Main knobs
+        # 主要パラメータ
         gloss_max_hints = parse_int(
             args.gloss_max_hints if args.gloss_max_hints is not None else cfg.get("gloss_max_hints", 6),
             6,
@@ -742,7 +868,7 @@ def main() -> None:
             max_total_chars=gloss_max_total_chars,
         )
 
-        # Optional: compute lemma frequency from train src (before gloss) for filtering.
+        # 任意: gloss 付与前の train src からレマ頻度を算出し、フィルタに使う
         if gloss_cfg.max_lemma_freq is not None:
             gloss_lemma_freq = build_lemma_frequency(
                 train_df[src_col].fillna("").astype(str).tolist(),
@@ -828,10 +954,10 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name_or_path, config=model_config)
 
-    # generation / padding / stop 条件 周りの安全化
+    # 生成 / パディング / 停止条件まわりの安全化
     #
     # - 一部の環境では model.config.pad_token_id が None のままになり、
-    #   Trainer の pad/gather の過程で -100 が混ざって decode が落ちることがある。
+    #   Trainer の pad/gather の過程で -100 が混ざってデコードが落ちることがある。
     # - eos_token_id / decoder_start_token_id が None の場合、生成が EOS で
     #   止まらず max_length まで伸びやすい。
     #
@@ -943,7 +1069,7 @@ def main() -> None:
     if generation_max_new_tokens is None:
         generation_max_new_tokens = parse_optional_int(cfg.get("max_new_tokens"))
     use_max_new_tokens = generation_max_new_tokens is not None and generation_max_new_tokens > 0
-    # Defaults are tuned to the best-performing 'beam2_cfg' decoding.
+    # デフォルトは最も良かった "beam2_cfg" デコードに合わせて調整済み
     num_beams = parse_int(cfg.get("num_beams"), 2)
     length_penalty = parse_float(cfg.get("length_penalty"), 0.8)
     no_repeat_ngram_size = parse_int(cfg.get("no_repeat_ngram_size"), 20)
@@ -954,7 +1080,7 @@ def main() -> None:
     bf16 = bool(cfg.get("bf16", False)) and torch.cuda.is_available()
     gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
 
-    # Postprocess: force single-sentence output (submission safety).
+    # 後処理: 提出の安全策として単文化する
     force_single_sentence = bool(cfg.get("force_single_sentence", True))
     single_sentence_mode = str(cfg.get("single_sentence_mode", "merge")).strip().lower()
     if single_sentence_mode not in {"merge", "truncate"}:
@@ -991,7 +1117,19 @@ def main() -> None:
     out_dir = Path(args.out) if args.out else get_artifacts_dir(cfg) / "nmt" / now_id("byt5")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # If frequency-based filtering was used, save the computed table for reuse in inference.
+    # 再現性のために検証文書IDを保存
+    if val_doc_ids is not None:
+        try:
+            val_ids_path = out_dir / "val_doc_ids.json"
+            val_ids_path.write_text(
+                json.dumps(val_doc_ids, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[val_split] saved val_doc_ids: {val_ids_path}")
+        except Exception as exc:
+            print(f"[WARN] failed to save val_doc_ids: {exc}")
+
+    # 頻度ベースのフィルタを使った場合、推論で再利用できるよう計算結果を保存
     if gloss_enabled and gloss_lemma_freq is not None:
         try:
             freq_path = out_dir / "gloss_lemma_freq.json"
@@ -1018,7 +1156,7 @@ def main() -> None:
                 return None
 
         def _sanitize_token_ids(token_ids: np.ndarray) -> np.ndarray:
-            """decode 前の安全化（-100 や範囲外 id を pad/unk に寄せる）。"""
+            """デコード前の安全化（-100 や範囲外 id を pad/unk に寄せる）。"""
 
             pad_id = tokenizer.pad_token_id
             if pad_id is None:
@@ -1163,7 +1301,7 @@ def main() -> None:
     metrics = train_result.metrics
     if val_ds is not None and val_df is not None and len(val_df) > 0 and post_eval_mode != "none":
         # -------------
-        # NOTE:
+        # 注意:
         # 以前は (1) trainer.evaluate() と (2) trainer.predict() の両方で
         # val 全体に対して generate を回しており、2回分の計算コストがかかっていた。
         # ここでは predict を1回だけ実行し、その metrics/loss を採用する。
@@ -1177,7 +1315,7 @@ def main() -> None:
             except (TypeError, ValueError):
                 return str(value)
 
-        # Optional: use a subset for faster iteration (approximate score).
+        # 任意: 反復を速くするためサブセットで近似評価
         val_df_eval = val_df
         val_ds_eval = val_ds
         if post_eval_max_rows is not None and 0 < post_eval_max_rows < len(val_df):
@@ -1207,7 +1345,7 @@ def main() -> None:
         # 1回だけ predict し、loss/metrics をここから拾う
         val_pred_output = trainer.predict(val_ds_eval, metric_key_prefix="eval", **val_gen_kwargs)
 
-        # --- generation stop diagnostics (1 line) ---
+        # --- 生成停止の診断（1行） ---
         try:
             import numpy as np  # type: ignore
 
@@ -1261,7 +1399,7 @@ def main() -> None:
                 )
         except Exception as e:
             print(f"[WARN] gen_stop diagnostics failed: {e}")
-        # --- /generation stop diagnostics ---
+        # --- /生成停止の診断 ---
         if getattr(val_pred_output, "metrics", None):
             metrics.update(val_pred_output.metrics)
 
@@ -1289,7 +1427,7 @@ def main() -> None:
             val_src_texts = val_df_eval[src_col].fillna("").astype(str).map(clean_text).tolist()
             val_ref_texts = val_df_eval[tgt_col].fillna("").astype(str).map(clean_text).tolist()
 
-            # decode (NOTE: Seq2SeqTrainer は gather/pad の都合で -100 を混ぜることがある)
+            # デコード（注意: Seq2SeqTrainer は gather/pad の都合で -100 を混ぜることがある）
             val_preds = decode_predictions(val_pred_output, tokenizer)
             if val_preds is None:
                 print("[WARN] val_pred decode skipped; downstream logs are skipped")
@@ -1314,7 +1452,7 @@ def main() -> None:
                 log_invariant_rates(val_src_texts, val_ref_texts, val_preds)
                 log_collapse_stats(val_preds, val_ref_texts)
 
-            # ---- generation length / EOS diagnostics (cheap: uses already-generated ids) ----
+            # ---- 生成長 / EOS 診断（軽量: 既に生成済みのIDを使用） ----
             try:
                 import numpy as np  # type: ignore
 
@@ -1478,6 +1616,14 @@ def main() -> None:
     meta = {
         "train_rows": len(train_df),
         "val_rows": 0 if val_df is None else len(val_df),
+        "val_split_unit": val_split_unit,
+        "val_doc_id_col": val_doc_id_col,
+        "val_source_col": val_source_col,
+        "val_exclude_sources": list(val_exclude_sources),
+        "val_holdout_all_sources": bool(val_holdout_all_sources),
+        "train_doc_count": int(train_df[val_doc_id_col].nunique()) if val_doc_id_col in train_df.columns else None,
+        "val_doc_count": int(val_df[val_doc_id_col].nunique()) if (val_df is not None and val_doc_id_col in val_df.columns) else None,
+        "val_doc_ids": val_doc_ids,
         "src_col": src_col,
         "tgt_col": tgt_col,
         "variant": variant,

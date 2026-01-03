@@ -4,7 +4,13 @@ max_source_length: 384
 max_target_length: 384
 val_ratio: 0.1
 seed: 42
-learning_rate: 5e-5
+
+val_split_unit: doc           # 分割単位: row | doc
+val_doc_id_col: oare_id       # doc 分割時の文書ID列
+val_source_col: source        # 任意の列。例: aligned/ocr
+val_exclude_sources: [ocr]    # val から除外（trainには残す）
+val_holdout_all_sources: true # true の場合、val 文書の全行を train から除外
+learning_rate: 0.0005
 num_train_epochs: 1
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 4
@@ -23,16 +29,16 @@ predict_with_generate: true
 generation_max_length: 320
 generation_max_new_tokens: 320
 num_beams: 2
-length_penalty: 0.8
+length_penalty: 0.6
 early_stopping: true
 no_repeat_ngram_size: 20
 repetition_penalty: 1.15
 
-# Submission safety / postprocess
+# 提出の安全策 / 後処理
 force_single_sentence: true
-single_sentence_mode: merge  # merge | truncate
+single_sentence_mode: merge  # 単文化モード: merge | truncate
 
-# Decode preset for infer_nmt (train_nmt always uses the values above)
+# infer_nmt 用デコードプリセット（train_nmt は上記設定を常に使用）
 decode_preset: cfg
 fp16: false
 gradient_checkpointing: false

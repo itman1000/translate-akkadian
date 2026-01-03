@@ -455,6 +455,13 @@ Path("/content/colab_env.sh").write_text("\n".join(env_lines) + "\n")
 print("TRAIN_PATH:", os.environ["TRAIN_PATH"])
 ```
 
+**NOTE（validation split の固定化）**
+
+- `dp.train_nmt` は、config の設定により **validation を OARE 由来の aligned 行だけから作成**します。
+- さらに `oare_id` 単位（doc 単位）で split することで、同一ドキュメントの文が train/val に跨らないようにしています。
+- OCR 混合（`mixed_train.parquet`）を使っても、**OCR 行は train のみに入り、val には入りません**。
+- split は `seed` で決まり、`--out` 配下に `val_doc_ids.json`（val に入った `oare_id` の一覧）が保存されます。
+
 #### 7-B) 学習（NMT）＋ validation 評価（BLEU / chrF++ / gm）
 ```bash
 %%bash

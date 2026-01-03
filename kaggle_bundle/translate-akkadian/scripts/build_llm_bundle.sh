@@ -21,6 +21,7 @@ mkdir -p "$OUT_DIR"
 
 cp "$ROOT/README.md" "$OUT_DIR/README.md"
 cp "$ROOT/README_KAGGLE.md" "$OUT_DIR/README_KAGGLE.md"
+cp "$ROOT/README_COLAB.md" "$OUT_DIR/README_COLAB.md"
 cp "$ROOT/requirements.txt" "$OUT_DIR/requirements.txt"
 cp "$ROOT/submit_kaggle.ipynb" "$OUT_DIR/submit_kaggle.ipynb"
 

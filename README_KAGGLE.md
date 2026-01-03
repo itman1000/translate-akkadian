@@ -118,6 +118,11 @@ Notebook 内で実行される主な流れ:
 - `artifacts/ocr_pairs/mixed_train.stats.json`
 
 学習データは `artifacts/ocr_pairs/mixed_train.parquet` に切り替わります。  
+
+**NOTE（validation split の固定化）**
+- `dp.train_nmt` の validation（val）は、`source!=ocr`（= aligned / OARE 由来）だけから作成します。
+- デフォルト設定では `oare_id` を使った **doc 単位 split** になるため、OCR 混合の有無で val が揺れにくく、本番タスクに近い評価になります。
+- val に含まれる `oare_id` 一覧は、学習出力ディレクトリ（`--out`）に `val_doc_ids.json` として保存されます。
 閾値は `configs/ocr.yaml` で調整できます。
 
 ## 5. 出力ファイル
