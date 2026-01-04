@@ -58,62 +58,50 @@ def _apply_repetition_penalty_(
     logits.scatter_(1, sequences, gathered)
 
 
-def _calc_banned_ngram_tokens(
-    prev_input_ids: torch.Tensor,
-    no_repeat_ngram_size: int,
-) -> List[List[int]]:
-    """Return banned tokens for each hypothesis (python lists).
-
-    Copied in spirit from HF `NoRepeatNGramLogitsProcessor`, but implemented
-    locally to avoid relying on internal APIs.
-    """
-
-    batch_size, cur_len = prev_input_ids.size()
-    n = int(no_repeat_ngram_size)
-    if n <= 0:
-        return [[] for _ in range(batch_size)]
-    if cur_len + 1 < n:
-        return [[] for _ in range(batch_size)]
-
-    banned_tokens: List[List[int]] = []
-    prev = prev_input_ids.tolist()
-
-    for hyp_idx in range(batch_size):
-        tokens = prev[hyp_idx]
-        # Build mapping: (n-1)-gram prefix -> set(next_token)
-        ngram_map = {}
-        for i in range(len(tokens) - n + 1):
-            ngram = tokens[i : i + n]
-            prefix = tuple(ngram[:-1])
-            nxt = ngram[-1]
-            ngram_map.setdefault(prefix, set()).add(nxt)
-
-        current_prefix = tuple(tokens[-(n - 1) :])
-        banned = list(ngram_map.get(current_prefix, set()))
-        banned_tokens.append(banned)
-
-    return banned_tokens
-
-
 def _apply_no_repeat_ngram_(
     logits: torch.Tensor,
     sequences: torch.Tensor,
     no_repeat_ngram_size: int,
 ) -> None:
-    """In-place no-repeat ngram constraint."""
+    """In-place no-repeat ngram constraint (GPU-friendly).
+
+    NOTE:
+      The common HF implementation uses `input_ids.tolist()` internally which forces a
+      GPU->CPU sync + copy every decoding step. That makes generation (and especially
+      ensembles) *much* slower and can look "CPU-speed" even on a GPU.
+
+      This implementation stays on the current device using tensor ops (unfold + compare).
+      It bans tokens that would create a repeated n-gram of size `no_repeat_ngram_size`.
+    """
 
     n = int(no_repeat_ngram_size)
     if n <= 0:
         return
 
-    banned_tokens = _calc_banned_ngram_tokens(sequences, n)
-    if not banned_tokens:
+    bsz, cur_len = sequences.size()
+    # We are selecting the NEXT token; need at least n-1 previous tokens to form an n-gram.
+    if cur_len + 1 < n:
         return
 
-    for i, banned in enumerate(banned_tokens):
-        if banned:
-            logits[i, banned] = -float("inf")
+    n1 = n - 1
 
+    # windows: (bsz, cur_len - n1 + 1, n1) == (bsz, cur_len - n + 2, n-1)
+    windows = sequences.unfold(1, n1, 1)
+
+    # Compare all windows except the last (it has no next-token to ban).
+    prev_windows = windows[:, :-1, :]  # (bsz, cur_len - n + 1, n-1)
+    last = sequences[:, -n1:]          # (bsz, n-1)
+
+    # matches: (bsz, cur_len - n + 1) — start positions whose (n-1)-gram matches the tail
+    matches = (prev_windows == last[:, None, :]).all(dim=-1)
+
+    # next_tokens[j] is the token that followed the (n-1)-gram at start position j
+    next_tokens = sequences[:, n1:]    # (bsz, cur_len - n + 1)
+
+    # Ban those next tokens
+    idx_i, idx_j = torch.where(matches)
+    banned = next_tokens[idx_i, idx_j]
+    logits[idx_i, banned] = -float("inf")
 
 def _avg_logits(logits_list: Sequence[torch.Tensor]) -> torch.Tensor:
     """Average logits across models in float32 for stability."""
@@ -135,7 +123,7 @@ def _length_penalize(score: float, length: int, length_penalty: float) -> float:
     return score / denom
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def ensemble_generate(
     models: List[torch.nn.Module],
     input_ids: torch.Tensor,

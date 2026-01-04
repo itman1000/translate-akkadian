@@ -263,15 +263,19 @@ def main() -> None:
                 gen_kwargs["max_length"] = max_target_length
             if use_ensemble:
                 # Logits-averaging ensemble decode.
+                # Note: our ensemble decoder is driven by max_new_tokens (HF と同じ概念).
+                ens_max_new_tokens = (
+                    gen_limit if use_max_new_tokens else max(1, int(max_target_length) - 1)
+                )
                 gen_cfg = EnsembleGenConfig(
-                    max_new_tokens=gen_limit,
-                    num_beams=gen_kwargs.get("num_beams", 1),
-                    length_penalty=gen_kwargs.get("length_penalty", 1.0),
-                    no_repeat_ngram_size=gen_kwargs.get("no_repeat_ngram_size", 0),
-                    repetition_penalty=gen_kwargs.get("repetition_penalty", 1.0),
-                    pad_token_id=pad_id if pad_id is not None else 0,
-                    eos_token_id=eos_id if eos_id is not None else 1,
-                    decoder_start_token_id=decoder_start_id if decoder_start_id is not None else 0,
+                    max_new_tokens=int(ens_max_new_tokens),
+                    num_beams=int(gen_kwargs.get("num_beams", 1)),
+                    length_penalty=float(gen_kwargs.get("length_penalty", 1.0)),
+                    repetition_penalty=float(gen_kwargs.get("repetition_penalty", 1.0)),
+                    no_repeat_ngram_size=int(gen_kwargs.get("no_repeat_ngram_size", 0)),
+                    pad_token_id=pad_id,
+                    eos_token_id=eos_id,
+                    decoder_start_token_id=decoder_start_id,
                 )
                 outputs = ensemble_generate(
                     models=models,
