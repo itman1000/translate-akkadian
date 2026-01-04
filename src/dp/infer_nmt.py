@@ -3,21 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import json
-import re
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
 from .align_train import normalize_transliteration
-from .gloss import (
-    DEFAULT_STOP_LEMMAS,
-    GlossAugmentConfig,
-    build_gloss_augmenter,
-    build_lemma_frequency,
-)
-from .utils import clean_text, enforce_single_sentence, get_data_dir, load_config, normalize_translation_output
+from .utils import clean_text, get_data_dir, load_config
+from .nmt_ensemble import EnsembleGenConfig, ensemble_generate
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -88,126 +82,26 @@ def batch_iter(items: List[str], batch_size: int) -> Iterable[List[str]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run NMT inference.")
     parser.add_argument("--config", required=True, help="Config file path.")
-    parser.add_argument("--ckpt", required=True, help="Model directory path.")
+    # Single checkpoint OR logits-averaging ensemble.
+    # - single: --ckpt artifacts/nmt/byt5_small
+    # - ensemble: --ckpts artifacts/nmt/m1,artifacts/nmt/m2,...
+    parser.add_argument("--ckpt", default=None, help="Model directory path (single model).")
+    parser.add_argument(
+        "--ckpts",
+        default=None,
+        help="Comma-separated model directory paths for logits-averaging ensemble (overrides --ckpt).",
+    )
     parser.add_argument("--test", default=None, help="Test CSV/Parquet path.")
     parser.add_argument("--out", required=True, help="Output predictions CSV path.")
     parser.add_argument("--data-dir", default=None, help="Data directory path.")
     parser.add_argument("--src-col", default=None, help="Source column name.")
     parser.add_argument("--id-col", default=None, help="ID column name.")
+    parser.add_argument(
+        "--ref-col",
+        default=None,
+        help="Optional reference column (e.g., 'translation') to compute BLEU/CHRF/GM for sanity-check.",
+    )
     parser.add_argument("--norm-variant", default=None, help="Normalize source with A/B/C.")
-
-    # Submission safety: force single-sentence output.
-    parser.add_argument(
-        "--no-force-single-sentence",
-        action="store_true",
-        help="Disable single-sentence postprocess for predictions.",
-    )
-    parser.add_argument(
-        "--single-sentence-mode",
-        default=None,
-        choices=["merge", "truncate"],
-        help="How to force one-sentence output: merge (default) or truncate.",
-    )
-    parser.add_argument(
-        "--normalize-output",
-        action="store_true",
-        help="Enable output normalization (fractions/spacing).",
-    )
-    parser.add_argument(
-        "--no-normalize-output",
-        action="store_true",
-        help="Disable output normalization even if config enables it.",
-    )
-
-    # Decode preset (helpful when config is minimal).
-    parser.add_argument(
-        "--decode-preset",
-        default=None,
-        choices=["cfg", "greedy", "beam2_free", "beam4_free"],
-        help=(
-            "Decoding preset. 'cfg' uses config/CLI values (recommended; matches train_nmt beam2_cfg). "
-            "Other presets override beams/penalties for quick comparison."
-        ),
-    )
-
-    # Optional: dictionary gloss hints appended to source text.
-    parser.add_argument(
-        "--use-gloss",
-        action="store_true",
-        help="Append compact English gloss hints using OA_Lexicon + eBL_Dictionary.",
-    )
-    parser.add_argument(
-        "--oa-lexicon",
-        default=None,
-        help="Path to OA_Lexicon_eBL.csv (default: <data-dir>/OA_Lexicon_eBL.csv).",
-    )
-    parser.add_argument(
-        "--ebl-dictionary",
-        default=None,
-        help="Path to eBL_Dictionary.csv (default: <data-dir>/eBL_Dictionary.csv).",
-    )
-    parser.add_argument(
-        "--gloss-max-hints",
-        type=int,
-        default=None,
-        help="Max number of gloss hints appended per sentence.",
-    )
-    parser.add_argument(
-        "--gloss-max-total-chars",
-        type=int,
-        default=None,
-        help="Max total chars for appended gloss payload.",
-    )
-    parser.add_argument(
-        "--gloss-match-types",
-        default=None,
-        help=(
-            "Comma/space-separated OA_Lexicon types to match (e.g., 'word,PN'). "
-            "Default: word"
-        ),
-    )
-    parser.add_argument(
-        "--gloss-max-match-len",
-        type=int,
-        default=None,
-        help="Max token span to match for gloss lookup (default: 4).",
-    )
-    parser.add_argument(
-        "--gloss-stop-lemmas",
-        default=None,
-        help="Comma/space-separated lemma stopwords to exclude from gloss hints.",
-    )
-    parser.add_argument(
-        "--gloss-stop-lemmas-file",
-        default=None,
-        help="Path to a newline-separated lemma stopword file (UTF-8).",
-    )
-    parser.add_argument(
-        "--gloss-no-default-stop-lemmas",
-        action="store_true",
-        help="Disable built-in stop lemmas (function words) for gloss.",
-    )
-    parser.add_argument(
-        "--gloss-max-lemma-freq",
-        type=int,
-        default=None,
-        help=(
-            "If set, only keep gloss hints for lemmas whose corpus frequency <= N. "
-            "In inference, loads <ckpt>/gloss_lemma_freq.json if present; otherwise computes from input."
-        ),
-    )
-    parser.add_argument(
-        "--gloss-lemma-freq",
-        default=None,
-        help="Optional path to gloss_lemma_freq.json (overrides <ckpt>/gloss_lemma_freq.json).",
-    )
-    parser.add_argument(
-        "--gloss-min-lemma-chars",
-        type=int,
-        default=None,
-        help="Minimum lemma length (chars) to allow in gloss hints (default: 2).",
-    )
-
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size.")
     parser.add_argument("--max-source-length", type=int, default=None, help="Max source length.")
     parser.add_argument("--max-target-length", type=int, default=None, help="Max target length.")
@@ -245,194 +139,6 @@ def main() -> None:
     else:
         src_texts = [clean_text(text) for text in src_texts]
 
-    # Optional: append gloss hints to the source text.
-    gloss_enabled = bool(
-        args.use_gloss
-        or bool(cfg.get("use_gloss", False))
-        or bool(cfg.get("gloss_enabled", False))
-    )
-
-    if gloss_enabled:
-        def _resolve_optional(path_value: Any, default_name: str) -> Path:
-            if path_value is None or str(path_value).strip() == "":
-                return data_dir / default_name
-            p = Path(str(path_value))
-            if not p.is_absolute():
-                cand = data_dir / p
-                if cand.exists():
-                    return cand
-            return p
-
-        def _as_bool(v: Any) -> bool:
-            if isinstance(v, bool):
-                return v
-            if v is None:
-                return False
-            return str(v).strip().lower() in {"1", "true", "yes", "y", "t"}
-
-        def _parse_list(v: Any) -> List[str]:
-            if v is None:
-                return []
-            if isinstance(v, (list, tuple, set)):
-                raw = [str(x) for x in v]
-            else:
-                s = str(v).strip()
-                if not s:
-                    return []
-                raw = re.split(r"[,\s]+", s)
-            out: List[str] = []
-            for x in raw:
-                x2 = str(x).strip()
-                if x2:
-                    out.append(x2)
-            return out
-
-        def _dedupe_keep_order(items: List[str]) -> List[str]:
-            seen: set[str] = set()
-            out: List[str] = []
-            for it in items:
-                if it in seen:
-                    continue
-                seen.add(it)
-                out.append(it)
-            return out
-
-        oa_lexicon_path = _resolve_optional(
-            args.oa_lexicon if args.oa_lexicon is not None else cfg.get("oa_lexicon_path", cfg.get("lexicon_path")),
-            "OA_Lexicon_eBL.csv",
-        )
-        ebl_dictionary_path = _resolve_optional(
-            args.ebl_dictionary if args.ebl_dictionary is not None else cfg.get("ebl_dictionary_path", cfg.get("ebl_dict_path")),
-            "eBL_Dictionary.csv",
-        )
-
-        match_types_value = (
-            args.gloss_match_types
-            if args.gloss_match_types is not None
-            else cfg.get("gloss_match_types")
-        )
-        match_types = _parse_list(match_types_value) or ["word"]
-
-        use_default_stop = not (
-            args.gloss_no_default_stop_lemmas
-            or _as_bool(cfg.get("gloss_no_default_stop_lemmas", False))
-        )
-        stop_lemmas: List[str] = []
-        if use_default_stop:
-            stop_lemmas.extend(list(DEFAULT_STOP_LEMMAS))
-        stop_lemmas.extend(_parse_list(cfg.get("gloss_stop_lemmas")))
-        stop_lemmas.extend(_parse_list(args.gloss_stop_lemmas))
-
-        stop_file_value = (
-            args.gloss_stop_lemmas_file
-            if args.gloss_stop_lemmas_file is not None
-            else cfg.get("gloss_stop_lemmas_file")
-        )
-        if stop_file_value:
-            stop_path = Path(str(stop_file_value))
-            if not stop_path.is_absolute():
-                cand = data_dir / stop_path
-                if cand.exists():
-                    stop_path = cand
-            if stop_path.exists():
-                for line in stop_path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    stop_lemmas.append(line)
-            else:
-                print(f"[WARN] gloss_stop_lemmas_file not found: {stop_path}")
-
-        stop_lemmas = _dedupe_keep_order([s for s in stop_lemmas if s.strip()])
-
-        gloss_max_hints = parse_int(
-            args.gloss_max_hints if args.gloss_max_hints is not None else cfg.get("gloss_max_hints", 6),
-            6,
-        )
-        gloss_max_total_chars = parse_int(
-            args.gloss_max_total_chars if args.gloss_max_total_chars is not None else cfg.get("gloss_max_total_chars", 220),
-            220,
-        )
-        gloss_max_match_len = parse_int(
-            args.gloss_max_match_len if args.gloss_max_match_len is not None else cfg.get("gloss_max_match_len", 4),
-            4,
-        )
-        gloss_max_lemma_freq = (
-            args.gloss_max_lemma_freq
-            if args.gloss_max_lemma_freq is not None
-            else parse_optional_int(cfg.get("gloss_max_lemma_freq"))
-        )
-        gloss_min_lemma_chars = parse_int(
-            args.gloss_min_lemma_chars if args.gloss_min_lemma_chars is not None else cfg.get("gloss_min_lemma_chars", 2),
-            2,
-        )
-        gloss_exclude_bound = not _as_bool(cfg.get("gloss_include_bound_morphemes", False))
-
-        gloss_cfg = GlossAugmentConfig(
-            enabled=True,
-            match_types=tuple(match_types),
-            max_match_len=gloss_max_match_len,
-            stop_lemmas=tuple(stop_lemmas),
-            min_lemma_chars=gloss_min_lemma_chars,
-            exclude_bound_morphemes=gloss_exclude_bound,
-            max_lemma_freq=gloss_max_lemma_freq,
-            max_hints=gloss_max_hints,
-            max_total_chars=gloss_max_total_chars,
-        )
-
-        lemma_freq: Optional[Dict[str, int]] = None
-        if gloss_cfg.max_lemma_freq is not None:
-            # Prefer a precomputed table (train_nmt saves it).
-            freq_path_value = args.gloss_lemma_freq
-            if not freq_path_value:
-                # auto: <ckpt>/gloss_lemma_freq.json
-                ckpt_dir = Path(args.ckpt)
-                cand = ckpt_dir / "gloss_lemma_freq.json"
-                if cand.exists():
-                    freq_path_value = str(cand)
-
-            if freq_path_value:
-                freq_path = Path(str(freq_path_value))
-                if not freq_path.is_absolute():
-                    cand = data_dir / freq_path
-                    if cand.exists():
-                        freq_path = cand
-                try:
-                    raw = json.loads(freq_path.read_text(encoding="utf-8"))
-                    if isinstance(raw, dict):
-                        lemma_freq = {str(k): int(v) for k, v in raw.items()}
-                        print(f"[gloss] loaded lemma_freq: {freq_path} (size={len(lemma_freq)})")
-                except Exception as exc:
-                    print(f"[WARN] failed to load gloss lemma_freq: {freq_path} ({exc})")
-                    lemma_freq = None
-
-            if lemma_freq is None:
-                # Fallback: compute from the inference inputs themselves.
-                lemma_freq = build_lemma_frequency(
-                    src_texts,
-                    oa_lexicon_path=oa_lexicon_path,
-                    match_columns=gloss_cfg.match_columns,
-                    match_types=gloss_cfg.match_types,
-                    max_match_len=gloss_cfg.max_match_len,
-                )
-                print(
-                    f"[gloss] lemma_freq computed from input: size={len(lemma_freq)} max_lemma_freq={gloss_cfg.max_lemma_freq}"
-                )
-
-        gloss_augment = build_gloss_augmenter(
-            gloss_cfg,
-            oa_lexicon_path=oa_lexicon_path,
-            ebl_dictionary_path=ebl_dictionary_path,
-            lemma_freq=lemma_freq,
-        )
-        src_texts = [gloss_augment(text) for text in src_texts]
-        print(
-            "[gloss] enabled: "
-            f"oa_lexicon={oa_lexicon_path} ebl_dictionary={ebl_dictionary_path} "
-            f"types={gloss_cfg.match_types} max_match_len={gloss_cfg.max_match_len} "
-            f"stop_lemmas={len(gloss_cfg.stop_lemmas)} max_lemma_freq={gloss_cfg.max_lemma_freq} "
-            f"max_hints={gloss_cfg.max_hints} max_total_chars={gloss_cfg.max_total_chars}"
-        )
     try:
         import torch  # type: ignore
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer  # type: ignore
@@ -441,65 +147,80 @@ def main() -> None:
             "transformers/torch が見つかりません。requirements.txt をインストールしてください。"
         ) from exc
 
-    model_dir = Path(args.ckpt)
-    if not model_dir.exists():
-        raise FileNotFoundError(f"Model dir not found: {model_dir}")
+    # --- load model(s) ---
+    ckpt_dirs: list[Path] = []
+    if args.ckpts:
+        ckpt_dirs = [Path(p.strip()) for p in str(args.ckpts).split(",") if p.strip()]
+    else:
+        cfg_ckpts = cfg.get("ensemble_ckpts") or cfg.get("ensemble_ckpt_dirs")
+        if isinstance(cfg_ckpts, str) and cfg_ckpts.strip():
+            ckpt_dirs = [Path(p.strip()) for p in cfg_ckpts.split(",") if p.strip()]
+        elif isinstance(cfg_ckpts, (list, tuple)):
+            ckpt_dirs = [Path(str(p)) for p in cfg_ckpts if str(p).strip()]
 
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-    model = AutoModelForSeq2SeqLM.from_pretrained(str(model_dir))
+    if not ckpt_dirs:
+        if args.ckpt is None:
+            raise ValueError("--ckpt または --ckpts (もしくは config の ensemble_ckpts) を指定してください")
+        ckpt_dirs = [Path(args.ckpt)]
+
+    missing = [p for p in ckpt_dirs if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Model dir not found: {missing[0]}")
+
+    tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dirs[0]))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
+    models: list[Any] = []
+    for p in ckpt_dirs:
+        m = AutoModelForSeq2SeqLM.from_pretrained(str(p))
+        # Align special token ids across checkpoints (important for generation).
+        pad_id = tokenizer.pad_token_id
+        eos_id = tokenizer.eos_token_id
+        if pad_id is not None:
+            m.config.pad_token_id = pad_id
+            if getattr(m.config, "decoder_start_token_id", None) is None:
+                m.config.decoder_start_token_id = pad_id
+            if getattr(m, "generation_config", None) is not None:
+                m.generation_config.pad_token_id = pad_id
+                if getattr(m.generation_config, "decoder_start_token_id", None) is None:
+                    m.generation_config.decoder_start_token_id = pad_id
+        if eos_id is not None:
+            m.config.eos_token_id = eos_id
+            if getattr(m, "generation_config", None) is not None:
+                m.generation_config.eos_token_id = eos_id
+        m.to(device)
+        m.eval()
+        models.append(m)
 
-    def _cfg_first(*keys: str, default: Any = None) -> Any:
-        for k in keys:
-            if k in cfg and cfg.get(k) is not None:
-                return cfg.get(k)
-        return default
+    use_ensemble = len(models) > 1
+    if use_ensemble:
+        print(f"[ensemble] logits-avg: n_models={len(models)}")
+    else:
+        model = models[0]
 
-    batch_size = args.batch_size or parse_int(_cfg_first("infer_batch_size", default=8), 8)
-    max_source_length = args.max_source_length or parse_int(_cfg_first("max_source_length", default=256), 256)
-    max_target_length = args.max_target_length or parse_int(_cfg_first("generation_max_length", "max_target_length", default=256), 256)
+    batch_size = args.batch_size or parse_int(cfg.get("infer_batch_size"), 8)
+    max_source_length = args.max_source_length or parse_int(cfg.get("max_source_length"), 256)
+    max_target_length = args.max_target_length or parse_int(cfg.get("generation_max_length"), 256)
     max_new_tokens = args.max_new_tokens
     if max_new_tokens is None:
         raw = cfg.get("generation_max_new_tokens", cfg.get("max_new_tokens"))
         max_new_tokens = parse_optional_int(raw)
     use_max_new_tokens = max_new_tokens is not None and max_new_tokens > 0
     gen_limit = max_new_tokens if use_max_new_tokens else max_target_length
-    # Defaults are tuned to the best-performing 'beam2_cfg' decoding from train_nmt.
-    num_beams = args.num_beams or parse_int(_cfg_first("num_beams", "generation_num_beams", default=2), 2)
+    num_beams = args.num_beams or parse_int(cfg.get("num_beams"), 4)
     length_penalty = args.length_penalty
     if length_penalty is None:
-        raw = _cfg_first("length_penalty")
-        length_penalty = float(raw) if raw is not None else 0.8
+        raw = cfg.get("length_penalty")
+        length_penalty = float(raw) if raw is not None else 1.0
     early_stopping = bool(args.early_stopping or cfg.get("early_stopping", False))
     no_repeat_ngram_size = args.no_repeat_ngram_size
     if no_repeat_ngram_size is None:
-        raw = _cfg_first("no_repeat_ngram_size")
-        no_repeat_ngram_size = int(raw) if raw is not None else 20
+        raw = cfg.get("no_repeat_ngram_size")
+        no_repeat_ngram_size = int(raw) if raw is not None else 0
     repetition_penalty = args.repetition_penalty
     if repetition_penalty is None:
-        raw = _cfg_first("repetition_penalty")
-        repetition_penalty = float(raw) if raw is not None else 1.15
-
-    # Optional decode preset override.
-    decode_preset = str(args.decode_preset or _cfg_first("decode_preset", default="cfg")).strip().lower()
-    if decode_preset == "greedy":
-        num_beams = 1
-        length_penalty = 1.0
-        no_repeat_ngram_size = 0
-        repetition_penalty = 1.0
-    elif decode_preset == "beam2_free":
-        num_beams = 2
-        length_penalty = 1.0
-        no_repeat_ngram_size = 0
-        repetition_penalty = 1.0
-    elif decode_preset == "beam4_free":
-        num_beams = 4
-        length_penalty = 1.0
-        no_repeat_ngram_size = 0
-        repetition_penalty = 1.0
+        raw = cfg.get("repetition_penalty")
+        repetition_penalty = float(raw) if raw is not None else 1.0
 
     print("=== 推論設定 ===")
     print(
@@ -516,6 +237,8 @@ def main() -> None:
     eos_missing = 0
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
+    base_model = models[0] if use_ensemble else model
+    decoder_start_id = getattr(base_model.config, "decoder_start_token_id", None) or pad_id
     early_cutoff = min(32, max(8, int(gen_limit * 0.25)))
     with torch.no_grad():
         for batch in batch_iter(src_texts, batch_size):
@@ -538,10 +261,29 @@ def main() -> None:
                 gen_kwargs["max_new_tokens"] = gen_limit
             else:
                 gen_kwargs["max_length"] = max_target_length
-            outputs = model.generate(
-                **inputs,
-                **gen_kwargs,
-            )
+            if use_ensemble:
+                # Logits-averaging ensemble decode.
+                gen_cfg = EnsembleGenConfig(
+                    max_new_tokens=gen_limit,
+                    num_beams=gen_kwargs.get("num_beams", 1),
+                    length_penalty=gen_kwargs.get("length_penalty", 1.0),
+                    no_repeat_ngram_size=gen_kwargs.get("no_repeat_ngram_size", 0),
+                    repetition_penalty=gen_kwargs.get("repetition_penalty", 1.0),
+                    pad_token_id=pad_id if pad_id is not None else 0,
+                    eos_token_id=eos_id if eos_id is not None else 1,
+                    decoder_start_token_id=decoder_start_id if decoder_start_id is not None else 0,
+                )
+                outputs = ensemble_generate(
+                    models=models,
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                    gen_cfg=gen_cfg,
+                )
+            else:
+                outputs = model.generate(
+                    **inputs,
+                    **gen_kwargs,
+                )
             if pad_id is not None:
                 lens = (outputs != pad_id).sum(dim=1).tolist()
             else:
@@ -566,43 +308,7 @@ def main() -> None:
                 decoded = tokenizer.batch_decode(safe_outputs, skip_special_tokens=True)
             else:
                 decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            preds.extend(decoded)
-
-    # Text postprocess (normalize + optional single-sentence enforcement)
-    normalize_output = bool(cfg.get("normalize_output", False))
-    if args.normalize_output:
-        normalize_output = True
-    if args.no_normalize_output:
-        normalize_output = False
-    normalize_fractions = bool(cfg.get("normalize_output_fractions", True))
-    normalize_units = bool(cfg.get("normalize_output_units", True))
-    if normalize_output:
-        preds_pp = [
-            normalize_translation_output(
-                text,
-                normalize_fractions=normalize_fractions,
-                normalize_units=normalize_units,
-            )
-            for text in preds
-        ]
-        changed = sum(int(a != b) for a, b in zip(preds_pp, preds))
-        changed_rate = changed / max(1, len(preds))
-        preds = preds_pp
-        print(
-            "[postprocess] "
-            f"normalize_output=True changed={changed_rate:.1%} "
-            f"fractions={normalize_fractions} units={normalize_units}"
-        )
-    else:
-        preds = [clean_text(text) for text in preds]
-    force_one = bool(_cfg_first("force_single_sentence", default=True)) and not bool(args.no_force_single_sentence)
-    one_sent_mode = str(args.single_sentence_mode or _cfg_first("single_sentence_mode", default="merge")).strip().lower()
-    if force_one:
-        preds_pp = [enforce_single_sentence(text, mode=one_sent_mode) for text in preds]
-        changed = sum(int(a != b) for a, b in zip(preds_pp, preds))
-        changed_rate = changed / max(1, len(preds))
-        preds = preds_pp
-        print(f"[postprocess] force_single_sentence=True mode={one_sent_mode} changed={changed_rate:.1%}")
+            preds.extend([clean_text(text) for text in decoded])
 
     if gen_token_lens:
         series = pd.Series(gen_token_lens)
@@ -625,6 +331,30 @@ def main() -> None:
                 f"p50={q[0.5]:.0f} p90={q[0.9]:.0f} p95={q[0.95]:.0f} p99={q[0.99]:.0f}"
             )
     log_texts_summary(preds, "pred")
+
+    # Optional: compute BLEU/CHRF/GM if a reference column is present.
+    ref_col = (
+        args.ref_col
+        or cfg.get("ref_col")
+        or cfg.get("target_col")
+        or cfg.get("tgt_col")
+        or cfg.get("label_col")
+    )
+    if ref_col is None and "translation" in df.columns:
+        ref_col = "translation"
+    if ref_col is not None and ref_col in df.columns:
+        try:
+            from sacrebleu.metrics import BLEU, CHRF
+
+            refs = [clean_text(str(x)) for x in df[ref_col].fillna("").tolist()]
+            hyps = preds
+            bleu = BLEU(tokenize="none").corpus_score(hyps, [refs]).score
+            chrf = CHRF(word_order=2).corpus_score(hyps, [refs]).score
+            gm = math.sqrt(bleu * chrf)
+            tag = f"ensemble={len(models)}" if use_ensemble else "single"
+            print(f"[eval_metrics][{tag}] bleu={bleu:.4f} chrf={chrf:.4f} gm={gm:.4f}")
+        except Exception as e:
+            print(f"[eval_metrics] skipped (failed to compute metrics): {e}")
 
     out_df = pd.DataFrame({"id": ids, "translation": preds})
     out_path = Path(args.out)

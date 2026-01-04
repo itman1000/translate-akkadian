@@ -575,7 +575,55 @@ python -m dp.validate   --submission submission.csv   --data-dir "${COMP_DATA_DI
 
 ---
 
-## 3-A. （任意）正規化の効果を val で比較
+## 3-A. （任意）ログitsアンサンブル（確率平均）で推論する（最終提出向け）
+
+複数の学習済みモデル（例：seed 違い）の **各ステップの出力確率（logits）を平均してからデコード**します。
+単純な「文字列の多数決」より安定して伸びやすい一方、**推論時間・VRAM がモデル本数分だけ増えます**。
+
+- まずは **2本アンサンブル**がおすすめ（伸びやすく、コストも現実的）
+- 余裕があれば seed を 3〜5 本まわして、良さそうな 2〜3 本を採用…という運用がやりやすいです
+
+**使い方（CLI）**（カンマ区切りで複数 ckpt を指定）
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+# ckpt のパスは自分の学習結果に合わせて変更
+python -m dp.infer_nmt \
+  --config "${NMT_CONFIG}" \
+  --ckpts artifacts/nmt/byt5_seed42,artifacts/nmt/byt5_seed43 \
+  --data-dir "${COMP_DATA_DIR}" \
+  --out artifacts/predictions_ens.csv
+```
+
+`--ckpts` の代わりに config へ書くこともできます（Notebook 側で編集しやすい）：
+```yaml
+ensemble_ckpts:
+  - artifacts/nmt/byt5_seed42
+  - artifacts/nmt/byt5_seed43
+```
+※ `NMT_CONFIG` が JSON でも同じキー名で配列を持たせれば OK です。
+
+**推論時に [eval_metrics] を出す（ref 列があるデータのみ）**
+参照（正解）列を含むデータで `--ref-col` を指定すると BLEU/chrF++/gm を計算して出力します。
+学習ログの `[eval_metrics]` と比較するための簡易チェック用途です（test には ref が無いので通常は使いません）。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+python -m dp.infer_nmt \
+  --config "${NMT_CONFIG}" \
+  --ckpts artifacts/nmt/byt5_seed42,artifacts/nmt/byt5_seed43 \
+  --test artifacts/aligned/aligned_train.parquet \
+  --src-col src_sent --ref-col tgt_sent --id-col oare_id \
+  --out artifacts/pred_debug.csv
+```
+※ `translation` は例です。データの正解列名（例：`target` / `tgt_sent`）に合わせて変更してください。
+
+---
+
+## 3-B. （任意）正規化の効果を val で比較
 `dp.train_nmt` 実行後に `artifacts/nmt/byt5_small_colab/val_doc_ids.json` がある前提です。
 学習時と同じ `TRAIN_PATH` と列名を使って、val 用の入力/正解を作ります。
 
@@ -659,6 +707,13 @@ python -m dp.eval --pred artifacts/val_pred_raw.csv --gold artifacts/val_gold.cs
 ### Q3. Drive 上で学習が遅い
 - repo と `artifacts/` は `/content`（ローカル）に置く
 - 学習後に必要な成果物だけ Drive にコピーする
+
+### Q4. zipが上書きできません
+- 下記で上書きできます
+```
+%%bash
+unzip -q -o /content/translate-akkadian.zip -d /content/repo
+```
 
 ---
 

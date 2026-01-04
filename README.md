@@ -356,6 +356,7 @@ OOM の場合は `max_source_length`/`max_target_length` を下げるか、
 ### NMT 関連ファイルの役割
 - `configs/nmt_byt5_small.yaml`: NMT 学習/評価のデフォルト設定。検証分割（row/doc）やデコード、提出時の単文化設定をまとめています。
 - `src/dp/train_nmt.py`: NMT の学習と事後評価を担当します。`--config` と `--train` を読み込み、必要なら `--use-gloss` で辞書グロスを付与します。
+- `src/dp/nmt_ensemble.py`: 複数 ckpt の logits を平均してデコードするアンサンブル実装です（`dp.infer_nmt` の `--ckpts` で使用）。
 
 ### 辞書グロス（eBL_Dictionary）による入力拡張（任意）
 
@@ -484,6 +485,40 @@ CLI（推論）:
 
 必要ならプリセットで比較できます:
 - `--decode-preset cfg|greedy|beam2_free|beam4_free`
+
+#### ログitsアンサンブル（確率平均）で推論する（最終提出向け）
+
+複数の学習済みモデル（例：seed 違い）の **各ステップの出力確率（logits）を平均してからデコード**します。
+単純な「文字列の多数決」より安定して伸びやすい一方、**推論時間・VRAM がモデル本数分だけ増えます**。
+
+- まずは **2本アンサンブル**がおすすめ（伸びやすく、コストも現実的）
+- 余裕があれば seed を 3〜5 本まわして、良さそうな 2〜3 本を採用…という運用がやりやすいです
+
+**使い方（CLI）**（カンマ区切りで複数 ckpt を指定）
+```bash
+python -m dp.infer_nmt --config configs/nmt_byt5_small.yaml \
+  --ckpts artifacts/nmt/byt5_seed42,artifacts/nmt/byt5_seed43 \
+  --test data/test.csv --out predictions_ens.csv
+```
+
+`--ckpts` の代わりに config へ書くこともできます（Notebook 側で編集しやすい）：
+```yaml
+ensemble_ckpts:
+  - artifacts/nmt/byt5_seed42
+  - artifacts/nmt/byt5_seed43
+```
+
+**推論時に [eval_metrics] を出す（ref 列があるデータのみ）**
+参照（正解）列を含むデータで `--ref-col` を指定すると BLEU/chrF++/gm を計算して出力します。
+学習ログの `[eval_metrics]` と比較するための簡易チェック用途です（test には ref が無いので通常は使いません）。
+アンサンブル時の生成長は `generation_max_new_tokens`（なければ `generation_max_length`）の設定に従います。
+```bash
+python -m dp.infer_nmt --config configs/nmt_byt5_small.yaml \
+  --ckpts artifacts/nmt/byt5_seed42,artifacts/nmt/byt5_seed43 \
+  --test artifacts/aligned/aligned_train.parquet --ref-col translation \
+  --out pred_debug.csv
+```
+※ `translation` は例です。データの正解列名（例：`target`）に合わせて変更してください。
 
 4) 提出:
 ```bash

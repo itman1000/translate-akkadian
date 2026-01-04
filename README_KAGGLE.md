@@ -49,6 +49,9 @@ python scripts/export_hf_model.py --model google/byt5-base --out models/byt5-bas
 - モデルDatasetが1つだけ見つかった場合は `MODEL_DIR` を自動設定します。
 - NMTのパラメータは Notebook 内の `overrides` 辞書で上書きできます。`configs/nmt_byt5_small.yaml` の全キーを列挙してあるので、`None` は元設定を維持し、上書きがある場合のみ `configs/nmt_byt5_small.runtime.json` を生成して使います。
 - `RUN_TRAIN=False` にすると学習をスキップします。推論に使うモデルは `INFER_CKPT_DIR` か `MODEL_DIR` で指定してください。
+- **logitsアンサンブル（モデル平均）**で推論したい場合は、`submit_kaggle.ipynb` の推論セルの `--ckpt` を `--ckpts` に変更し、カンマ区切りで複数 ckpt を渡します（例：2本なら `--ckpts 'ckpt_seed42,ckpt_seed43'`）。
+  - まずは **2本アンサンブル**がおすすめ（推論コストが2倍程度で伸びやすい）
+
 - `sacrebleu` が未導入の場合、Notebook は `sacrebleu` だけを追加インストールします（`requirements.txt` 全体は入れません）。
 - `sacrebleu` が未導入かつインストール不可の場合、学習ログ内の BLEU/chrF++ はスキップされます（学習自体は継続）。
 
