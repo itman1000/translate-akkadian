@@ -299,7 +299,12 @@ def log_invariant_rates(
         print("pred_allcaps_token_rate=0.0%")
     punct_series = pd.Series(pred_punct)
     p_punct = punct_series.quantile([0.5, 0.9, 0.95, 0.99]).to_dict()
-    multi_sentence_rate = (punct_series >= 2).mean()
+    try:
+        from .audit_mismatch import is_multi_sentence as _is_multi_sentence
+        multi_sentence_rate = sum(1 for t in pred_texts if _is_multi_sentence(t)) / max(len(pred_texts), 1)
+    except Exception:
+        # fallback (should be rare)
+        multi_sentence_rate = (punct_series >= 2).mean()
     print(
         f"pred_punct_p50={p_punct[0.5]:.0f} p90={p_punct[0.9]:.0f} "
         f"p95={p_punct[0.95]:.0f} p99={p_punct[0.99]:.0f} "
@@ -535,6 +540,72 @@ def main() -> None:
         ),
     )
 
+    # 任意: validation の予測/監査（ずれ分類）を CSV として保存
+    parser.add_argument(
+        "--save-val-preds",
+        action="store_true",
+        help="Save validation src/ref/pred as a CSV under --out directory.",
+    )
+    parser.add_argument(
+        "--val-preds-path",
+        default=None,
+        help="Optional path for validation predictions CSV (relative paths are under --out).",
+    )
+    parser.add_argument(
+        "--save-val-audit",
+        action="store_true",
+        help="Save mismatch audit CSV (type labels + diagnostics) for validation predictions.",
+    )
+    parser.add_argument(
+        "--val-audit-path",
+        default=None,
+        help="Optional path for mismatch audit CSV (relative paths are under --out).",
+    )
+    parser.add_argument(
+        "--audit-sim-th",
+        type=float,
+        default=None,
+        help="Similarity threshold for alignment shift detection (default: 0.85).",
+    )
+    parser.add_argument(
+        "--audit-margin",
+        type=float,
+        default=None,
+        help="Required margin over self-similarity to call an alignment shift (default: 0.08).",
+    )
+    parser.add_argument(
+        "--audit-ngram-n",
+        type=int,
+        default=None,
+        help="Character n-gram size for similarity (default: 4).",
+    )
+
+    parser.add_argument(
+        "--audit-max-shift",
+        type=int,
+        default=None,
+        help="Max within-doc shift (±k) to search for alignment hinting (default: 3).",
+    )
+    parser.add_argument(
+        "--audit-template-min-count",
+        type=int,
+        default=None,
+        help="Min frequency to flag a repeated prediction template (default: 5).",
+    )
+    parser.add_argument(
+        "--audit-template-sim-max",
+        type=float,
+        default=None,
+        help="Only flag template collapse when sim_self < this (default: 0.55).",
+    )
+
+    parser.add_argument(
+        "--audit-near-match-th",
+        type=float,
+        default=None,
+        help="Classify as near-match (T04) when sim_self >= this (default: 0.90).",
+    )
+
     # 任意: 辞書グロスのヒントをソース末尾に付与
     parser.add_argument(
         "--use-gloss",
@@ -623,6 +694,31 @@ def main() -> None:
     post_eval_max_rows = cfg.get("post_eval_max_rows")
     if post_eval_max_rows is not None:
         post_eval_max_rows = parse_int(post_eval_max_rows, 0) or None
+
+    # 任意: validation の予測/監査CSVを保存
+    save_val_preds = bool(args.save_val_preds or bool(cfg.get("save_val_preds", False)))
+    save_val_audit = bool(args.save_val_audit or bool(cfg.get("save_val_audit", False)))
+    val_preds_path = args.val_preds_path if args.val_preds_path is not None else cfg.get("val_preds_path")
+    val_audit_path = args.val_audit_path if args.val_audit_path is not None else cfg.get("val_audit_path")
+    audit_sim_th = args.audit_sim_th if args.audit_sim_th is not None else parse_float(cfg.get("audit_sim_th"), 0.85)
+    audit_margin = args.audit_margin if args.audit_margin is not None else parse_float(cfg.get("audit_margin"), 0.08)
+    audit_ngram_n = args.audit_ngram_n if args.audit_ngram_n is not None else parse_int(cfg.get("audit_ngram_n"), 4)
+    if audit_ngram_n is None or audit_ngram_n <= 0:
+        audit_ngram_n = 4
+
+    audit_max_shift = args.audit_max_shift if args.audit_max_shift is not None else parse_int(cfg.get("audit_max_shift"), 3)
+    if audit_max_shift is None or audit_max_shift <= 0:
+        audit_max_shift = 3
+    audit_template_min_count = args.audit_template_min_count if args.audit_template_min_count is not None else parse_int(cfg.get("audit_template_min_count"), 5)
+    if audit_template_min_count is None or audit_template_min_count <= 1:
+        audit_template_min_count = 5
+    audit_template_sim_max = args.audit_template_sim_max if args.audit_template_sim_max is not None else parse_float(cfg.get("audit_template_sim_max"), 0.55)
+    if audit_template_sim_max is None or audit_template_sim_max <= 0:
+        audit_template_sim_max = 0.55
+
+    audit_near_match_th = args.audit_near_match_th if args.audit_near_match_th is not None else parse_float(cfg.get("audit_near_match_th"), 0.90)
+    if audit_near_match_th is None or audit_near_match_th <= 0 or audit_near_match_th > 1.0:
+        audit_near_match_th = 0.90
 
     src_col = args.src_col or cfg.get("src_col", "src_sent")
     tgt_col = args.tgt_col or cfg.get("tgt_col", "tgt_sent")
@@ -1437,6 +1533,95 @@ def main() -> None:
                         enforce_single_sentence(text, mode=single_sentence_mode)
                         for text in val_preds
                     ]
+
+                # ---- 任意: validation 予測/監査CSVの保存 ----
+                if save_val_preds or save_val_audit:
+                    try:
+                        from .audit_mismatch import AuditConfig, build_audit_df, strip_lex_gloss
+
+                        def _resolve_path(path_value: object, default_name: str) -> Path:
+                            if path_value is None or str(path_value).strip() == "":
+                                p = out_dir / default_name
+                            else:
+                                p = Path(str(path_value))
+                                if not p.is_absolute():
+                                    p = out_dir / p
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            return p
+
+                        # post_eval_max_rows でサブセット評価している場合、保存対象は full val を優先する
+                        df_save = val_df_eval
+                        preds_save = val_preds
+                        if val_df is not None and post_eval_max_rows is not None and len(val_df_eval) != len(val_df):
+                            try:
+                                full_ds = Dataset.from_pandas(val_df[[src_col, tgt_col]], preserve_index=False)
+                                full_ds = full_ds.map(preprocess, batched=True, remove_columns=[src_col, tgt_col])
+                                full_out = trainer.predict(full_ds, metric_key_prefix="audit", **val_gen_kwargs)
+                                full_preds = decode_predictions(full_out, tokenizer)
+                                if full_preds is not None:
+                                    if force_single_sentence:
+                                        full_preds = [
+                                            enforce_single_sentence(text, mode=single_sentence_mode)
+                                            for text in full_preds
+                                        ]
+                                    df_save = val_df
+                                    preds_save = full_preds
+                                    print(
+                                        f"[val_audit] post_eval_max_rows is set; regenerated full val preds: rows={len(df_save)}"
+                                    )
+                                else:
+                                    print("[WARN] failed to decode full val preds; fallback to subset for audit")
+                            except Exception as exc:
+                                print(f"[WARN] failed to regenerate full val preds: {exc}")
+
+                        keep_cols: List[str] = []
+                        for c in [
+                            val_doc_id_col,
+                            val_source_col,
+                            "src_norm_variant",
+                            "align_method",
+                            "align_meta",
+                            "flags",
+                        ]:
+                            if c and c in df_save.columns and c not in keep_cols:
+                                keep_cols.append(c)
+                        keep_cols.extend([src_col, tgt_col])
+
+                        pred_df = df_save[keep_cols].copy()
+                        pred_df = pred_df.rename(columns={src_col: "src", tgt_col: "ref"})
+                        pred_df["src_no_gloss"] = pred_df["src"].map(strip_lex_gloss)
+                        pred_df["pred"] = preds_save
+
+                        if save_val_preds:
+                            p_preds = _resolve_path(val_preds_path, "val_predictions.csv")
+                            pred_df.to_csv(p_preds, index=False)
+                            print(f"[val_preds] saved: {p_preds} rows={len(pred_df)}")
+
+                        if save_val_audit:
+                            a_cfg = AuditConfig(
+                                sim_th=float(audit_sim_th),
+                                margin=float(audit_margin),
+                                ngram_n=int(audit_ngram_n),
+                                max_shift=int(audit_max_shift),
+                                template_min_count=int(audit_template_min_count),
+                                template_sim_max=float(audit_template_sim_max),
+                            )
+                            group_col = val_doc_id_col if val_doc_id_col in pred_df.columns else None
+                            audit_df = build_audit_df(
+                                pred_df,
+                                src_col="src_no_gloss",
+                                ref_col="ref",
+                                pred_col="pred",
+                                group_col=group_col,
+                                cfg=a_cfg,
+                            )
+                            p_audit = _resolve_path(val_audit_path, "val_audit.csv")
+                            audit_df.to_csv(p_audit, index=False)
+                            top = audit_df["type_primary"].value_counts().head(10).to_dict()
+                            print(f"[val_audit] saved: {p_audit} rows={len(audit_df)} top_types={top}")
+                    except Exception as exc:
+                        print(f"[WARN] failed to save val predictions/audit: {exc}")
+                # ---- /validation 予測/監査CSVの保存 ----
                 # compute_metrics が無効だった場合のフォールバック（環境差対策）
                 if eval_bleu is None or eval_chrf is None or eval_gm is None:
                     fallback = compute_bleu_chrf(val_preds, val_ref_texts)

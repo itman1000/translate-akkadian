@@ -454,6 +454,50 @@ python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
 さらに高速化したい場合は、config に `post_eval_max_rows` を追加して **val をランダム間引き**できます（例：200〜500）。
 ※ 近似スコアになるため、採用判断は full（全件）で揃えて比較してください。
 
+#### ずれの型分類（前処理・アラインの監査CSV）
+
+前処理やアラインの改善を高速に回すため、`dp.train_nmt` は **validation の src/ref/pred と、"ずれ" の型分類** を CSV として保存できます。
+
+```bash
+python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
+  --train artifacts/aligned/aligned_train.parquet --variant C --drop-flagged \
+  --out artifacts/nmt/byt5_small \
+  --post-eval-mode full \
+  --save-val-preds --save-val-audit
+```
+
+`--out` 配下に以下が出力されます：
+
+- `val_predictions.csv` : `src` / `src_no_gloss` / `ref` / `pred`（監査の元データ）
+- `val_audit.csv` : 追加の診断列（"ずれ" の主分類 + タグ + 近傍ヒント）
+  - `type_primary` : ずれの主分類（T00/T01/.../T90）
+    - `T04_NEAR_MATCH` : **ほぼ一致**（sim_self が高いが完全一致ではない。例：人名の綴り差、微小な脱落/置換）
+  - `type_secondary` : 付加タグ（例：`TAG_TEMPLATE`, `TAG_NUM_DROP`, `TAG_NAME_DROP`, `TAG_GLOSS_LEAK`）
+  - `t90_reason` : **T90 の二次分類**（例：`T90_TEMPLATE_COLLAPSE`, `T90_NUMERIC`, `T90_NAME`, `T90_COPY_SRC`）
+  - `fix_route` : 直すべき箇所の目安（`INPUT_PP` / `OUTPUT_PP` / `ALIGN` / `DECODE` / `MODEL`）
+  - `sim_self` : pred vs ref の類似度（n2 正規化後の char n-gram Jaccard）
+  - `best_offset` / `best_sim` / `best_delta` : 同一 doc 内で ±k 行ずらした ref と比較したときの最良（アラインずれの当たりを付ける用）
+  - `pred_template_count` : 同一予測テンプレの出現回数（崩壊検知）
+
+すでに `src/ref/pred` の表を持っている場合は、以下でも同じ監査CSVを生成できます:
+
+```bash
+python -m dp.audit_csv --input val_predictions.csv --out val_audit.csv \
+  --src-col src_no_gloss --ref-col ref --pred-col pred --group-col oare_id
+```
+
+監査の感度を変えたい場合は以下を調整できます（config/CLI 両方対応）:
+
+- `audit_sim_th` / `--audit-sim-th` : アラインずれ判定の類似度しきい値
+- `audit_margin` / `--audit-margin` : self からどれだけ上回れば「ずれ」とみなすか
+- `audit_ngram_n` / `--audit-ngram-n` : 類似度の n-gram サイズ
+- `audit_max_shift` / `--audit-max-shift` : ±k 行まで「ずれ候補」を探す（既定: 3）
+- `audit_template_min_count` / `--audit-template-min-count` : テンプレ崩壊とみなす最小出現回数
+- `audit_template_sim_max` / `--audit-template-sim-max` : sim_self がこれ未満のときのみテンプレ崩壊タグを付与
+- `audit_near_match_th` / `--audit-near-match-th` : sim_self がこの値以上なら `T04_NEAR_MATCH` として分類（既定: 0.90）
+
+※ `post_eval_max_rows` で val を間引いている場合でも、`--save-val-audit` を付けると **全 val で再推論して保存**するようにしています（時間が掛かる場合は `post_eval_max_rows` を外してください）。
+
 
 3) 推論:
 ```bash

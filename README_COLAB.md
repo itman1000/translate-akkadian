@@ -476,13 +476,63 @@ if [ -d "${MODEL_DIR}" ]; then
   MODEL_ARG="--model-name-or-path ${MODEL_DIR}"
 fi
 
-python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}"   --train "${TRAIN_PATH}"   --variant C --drop-flagged   --out artifacts/nmt/byt5_small_colab   ${MODEL_ARG}   --post-eval-mode full
+python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}"   --train "${TRAIN_PATH}"   --variant C --drop-flagged   --out artifacts/nmt/byt5_small_colab   ${MODEL_ARG}   --post-eval-mode full   --save-val-preds --save-val-audit
+
+# 実行後、以下が `--out` 配下に保存されます:
+# - val_predictions.csv : src/ref/pred（監査の元データ）
+# - val_audit.csv       : ずれの型分類・診断列付き
 ```
 
 ログ中に以下のような行が出ます（例）：
 - `[eval_metrics] bleu=... chrf=... gm=...`
 
 > 反復を速くしたい場合は `--post-eval-mode quick`（指標のみ）にしてください。
+
+#### 7-C) 監査CSVをざっと見る（ずれの型分類）
+```python
+import pandas as pd
+from pathlib import Path
+
+audit_path = Path(REPO_DIR) / "artifacts/nmt/byt5_small_colab/val_audit.csv"
+
+df = pd.read_csv(audit_path)
+
+# 型の頻度トップ（まずは多い原因から潰す）
+# - T04_NEAR_MATCH は「ほぼ一致」枠（人名の綴り差など）なので、まずは他の大きい原因から見るのがおすすめ
+display(df["type_primary"].value_counts().head(20))
+
+# スコア（sim_self）が低い順に目視確認
+worst = df.sort_values("sim_self").head(30)
+cols = [
+    c
+    for c in [
+        "oare_id",
+        "src_no_gloss",
+        "ref",
+        "pred",
+        "type_primary",
+        "t90_reason",
+        "type_secondary",
+        "pred_template_count",
+        "ref_digit",
+        "pred_digit",
+        "ref_name_cnt",
+        "pred_name_cnt",
+        "fix_route",
+        "sim_self",
+        "best_offset",
+        "best_delta",
+    ]
+    if c in worst.columns
+]
+display(worst[cols])
+```
+
+（任意）Colab から CSV をダウンロードする場合:
+```python
+from google.colab import files
+files.download(str(audit_path))
+```
 
 ---
 
