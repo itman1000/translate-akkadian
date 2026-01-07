@@ -483,6 +483,22 @@ python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}
 # - val_audit.csv       : ずれの型分類・診断列付き
 ```
 
+#### val_todo.csv（監査の「見る順」を作る：任意だがおすすめ）
+
+`val_audit.csv` から「前処理/後処理で直せそうな行」を優先度付きで抽出し、`val_todo.csv` を作れます。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+python -m dp.todo_csv \
+  --input  artifacts/nmt/byt5_small_colab/val_audit.csv \
+  --output artifacts/nmt/byt5_small_colab/val_todo.csv \
+  --max-rows 200 --max-rows-per-doc 5
+```
+
+- `priority` の高い行から目視して原因を分類し、**「前処理で直るか」**を効率良く見極めるのが目的です。
+
 ログ中に以下のような行が出ます（例）：
 - `[eval_metrics] bleu=... chrf=... gm=...`
 
@@ -498,7 +514,6 @@ audit_path = Path(REPO_DIR) / "artifacts/nmt/byt5_small_colab/val_audit.csv"
 df = pd.read_csv(audit_path)
 
 # 型の頻度トップ（まずは多い原因から潰す）
-# - T04_NEAR_MATCH は「ほぼ一致」枠（人名の綴り差など）なので、まずは他の大きい原因から見るのがおすすめ
 display(df["type_primary"].value_counts().head(20))
 
 # スコア（sim_self）が低い順に目視確認

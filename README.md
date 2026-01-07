@@ -471,7 +471,6 @@ python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
 - `val_predictions.csv` : `src` / `src_no_gloss` / `ref` / `pred`（監査の元データ）
 - `val_audit.csv` : 追加の診断列（"ずれ" の主分類 + タグ + 近傍ヒント）
   - `type_primary` : ずれの主分類（T00/T01/.../T90）
-    - `T04_NEAR_MATCH` : **ほぼ一致**（sim_self が高いが完全一致ではない。例：人名の綴り差、微小な脱落/置換）
   - `type_secondary` : 付加タグ（例：`TAG_TEMPLATE`, `TAG_NUM_DROP`, `TAG_NAME_DROP`, `TAG_GLOSS_LEAK`）
   - `t90_reason` : **T90 の二次分類**（例：`T90_TEMPLATE_COLLAPSE`, `T90_NUMERIC`, `T90_NAME`, `T90_COPY_SRC`）
   - `fix_route` : 直すべき箇所の目安（`INPUT_PP` / `OUTPUT_PP` / `ALIGN` / `DECODE` / `MODEL`）
@@ -494,10 +493,24 @@ python -m dp.audit_csv --input val_predictions.csv --out val_audit.csv \
 - `audit_max_shift` / `--audit-max-shift` : ±k 行まで「ずれ候補」を探す（既定: 3）
 - `audit_template_min_count` / `--audit-template-min-count` : テンプレ崩壊とみなす最小出現回数
 - `audit_template_sim_max` / `--audit-template-sim-max` : sim_self がこれ未満のときのみテンプレ崩壊タグを付与
-- `audit_near_match_th` / `--audit-near-match-th` : sim_self がこの値以上なら `T04_NEAR_MATCH` として分類（既定: 0.90）
 
 ※ `post_eval_max_rows` で val を間引いている場合でも、`--save-val-audit` を付けると **全 val で再推論して保存**するようにしています（時間が掛かる場合は `post_eval_max_rows` を外してください）。
 
+
+### val_todo.csv（val_audit から TODO 抽出）
+
+`val_audit.csv` を「上から順に見ていけば良い」形に落とし込んだ補助 CSV です。
+**alignment ずれ・merge 候補・数値/固有名詞落ち**など、前処理/後処理で直せそうなものを優先度付きで抽出します。
+
+```bash
+python -m dp.todo_csv \
+  --input  artifacts/nmt/byt5_small/val_audit.csv \
+  --output artifacts/nmt/byt5_small/val_todo.csv \
+  --max-rows 200 --max-rows-per-doc 5
+```
+
+- `priority` の高い行から目視して、「データ/前処理で直るか」「デコード調整か」「モデル能力不足か」を切り分けてください。
+- `val_audit.csv` の列の詳細は `docs/06_VAL_AUDIT_COLUMNS.md`（または README の `val_audit.csv` 節）を参照してください。
 
 3) 推論:
 ```bash
