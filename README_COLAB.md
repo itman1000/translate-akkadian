@@ -104,38 +104,38 @@ MyDrive/kaggle_input/
 
 - 公式データ（train.csv / test.csv / sample_submission.csv …）
   - `/content/kaggle/input/deep-past-initiative-machine-translation`
-- （任意）ByT5-base のローカル保存
-  - `/content/kaggle/input/byt5-base-model/byt5-base`
+- （任意）ByT5（base/large）のローカル保存
+  - `/content/kaggle/input/byt5-<variant>-model/byt5-<variant>`
 
 ```bash
 %%bash
 # ===== ここを自分のDrive構成に合わせて編集してください =====
 DRIVE_DATA_ROOT="/content/drive/MyDrive/kaggle_input"
 
+# ByT5 の選択（base / large）
+BYT5_VARIANT="base"  # "large" も可
+
 # 公式データ（train.csv, test.csv があるディレクトリ）
 ln -sf "${DRIVE_DATA_ROOT}/deep-past-initiative-machine-translation"   /content/kaggle/input/deep-past-initiative-machine-translation
 
-# （任意）ByT5-base をローカルで使う場合（無ければこの行は削除OK）
-ln -sf "${DRIVE_DATA_ROOT}/byt5-base-model" /content/kaggle/input/byt5-base-model
-
 # 確認
 ls -la /content/kaggle/input/deep-past-initiative-machine-translation | head
-ls -la /content/kaggle/input/byt5-base-model/byt5-base 2>/dev/null | head || true
+ls -la "/content/kaggle/input/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}" 2>/dev/null | head || true
 ```
 
 > **ByT5 のモデルを Drive に置いていない場合**でも動きます。  
-> その場合は `model_name_or_path=google/byt5-base` を使って Hugging Face から自動取得します（Colab はネット接続できる想定）。  
+> その場合は `model_name_or_path=google/byt5-<variant>` を使って Hugging Face から自動取得します（Colab はネット接続できる想定）。  
 > 既定のキャッシュ先は `/root/.cache/huggingface` で、セッション終了で消えます。永続化したい場合は以下の「Drive に保存」「キャッシュを Drive に移す」を使ってください。
 
 ---
 
 #### 4-C) ByT5 を Drive に保存する（任意・永続化）
-すでに `byt5-base` を持っている場合は、Drive に以下の構成で置いてください。
+すでに ByT5（base/large）を持っている場合は、Drive に以下の構成で置いてください（`<variant>` は `base` / `large`）。
 
 ```
 MyDrive/kaggle_input/
-  byt5-base-model/
-    byt5-base/
+  byt5-<variant>-model/
+    byt5-<variant>/
       config.json
       generation_config.json
       pytorch_model.bin
@@ -148,16 +148,23 @@ MyDrive/kaggle_input/
 
 ```bash
 %%bash
+# ByT5 の選択（base / large）
+BYT5_VARIANT="base"  # "large" も可
+export BYT5_VARIANT
+
 # Drive に保存する ByT5 の保存先
-OUT_DIR="/content/drive/MyDrive/kaggle_input/byt5-base-model/byt5-base"
+OUT_DIR="/content/drive/MyDrive/kaggle_input/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}"
 mkdir -p "$(dirname "${OUT_DIR}")"
 
 python - <<'PY'
+import os
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-out_dir = "/content/drive/MyDrive/kaggle_input/byt5-base-model/byt5-base"
-tokenizer = AutoTokenizer.from_pretrained("google/byt5-base")
-model = AutoModelForSeq2SeqLM.from_pretrained("google/byt5-base")
+byt5_variant = os.environ.get("BYT5_VARIANT", "base").strip()
+model_id = f"google/byt5-{byt5_variant}"
+out_dir = f"/content/drive/MyDrive/kaggle_input/byt5-{byt5_variant}-model/byt5-{byt5_variant}"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
 tokenizer.save_pretrained(out_dir)
 model.save_pretrained(out_dir)
 print("saved:", out_dir)
@@ -167,7 +174,7 @@ PY
 ---
 
 #### 4-D) Hugging Face のキャッシュを Drive に移す（任意・再ダウンロード回避）
-`google/byt5-base` を毎回再取得したくない場合は、**キャッシュ先を Drive に変更**できます。  
+`google/byt5-<variant>` を毎回再取得したくない場合は、**キャッシュ先を Drive に変更**できます。  
 このセルは **モデル取得前に実行**してください。
 
 ```python
@@ -193,8 +200,17 @@ REPO_DIR = "/content/repo/translate-akkadian"
 # コンペデータ（train.csv, test.csv のある場所）
 COMP_DATA_DIR = "/content/kaggle/input/deep-past-initiative-machine-translation"
 
-# （任意）ローカルモデル（無ければ空でOK）
-MODEL_DIR = "/content/kaggle/input/byt5-base-model/byt5-base"
+# ===== ByT5 の選択（base / large）=====
+BYT5_VARIANT = "base"  # "large" も可
+# NOTE: large は OOM しやすいので、必要ならセル 5-B で batch/長さ/grad_ckpt/fp16(bf16) を調整してください
+
+# Hugging Face のモデルID（ネットが使える場合）
+MODEL_HF = f"google/byt5-{BYT5_VARIANT}"
+
+# （任意）オフライン/永続化用：Drive→/content/kaggle/input に置いたモデル（無ければ Hugging Face を使う）
+MODEL_DATASET = f"byt5-{BYT5_VARIANT}-model"
+MODEL_DIR = f"/content/kaggle/input/{MODEL_DATASET}/byt5-{BYT5_VARIANT}"
+MODEL_NAME_OR_PATH = MODEL_DIR if Path(MODEL_DIR).exists() else MODEL_HF
 
 # NMT 設定ファイル（デフォルト）
 NMT_CONFIG = "configs/nmt_byt5_small.yaml"
@@ -208,7 +224,9 @@ RUN_OCR = "0"
 # dp パッケージを import できるようにする
 os.environ["REPO_DIR"] = REPO_DIR
 os.environ["COMP_DATA_DIR"] = COMP_DATA_DIR
+os.environ["BYT5_VARIANT"] = BYT5_VARIANT
 os.environ["MODEL_DIR"] = MODEL_DIR
+os.environ["MODEL_NAME_OR_PATH"] = MODEL_NAME_OR_PATH
 os.environ["NMT_CONFIG"] = NMT_CONFIG
 os.environ["TRAIN_PATH"] = TRAIN_PATH
 os.environ["RUN_OCR"] = RUN_OCR
@@ -218,7 +236,10 @@ os.environ["PYTHONPATH"] = f"{REPO_DIR}/src"
 env_lines = [
     f'export REPO_DIR="{REPO_DIR}"',
     f'export COMP_DATA_DIR="{COMP_DATA_DIR}"',
+    f'export BYT5_VARIANT="{BYT5_VARIANT}"',
+    f'export MODEL_DATASET="{MODEL_DATASET}"',
     f'export MODEL_DIR="{MODEL_DIR}"',
+    f'export MODEL_NAME_OR_PATH="{MODEL_NAME_OR_PATH}"',
     f'export NMT_CONFIG="{NMT_CONFIG}"',
     f'export TRAIN_PATH="{TRAIN_PATH}"',
     f'export RUN_OCR="{RUN_OCR}"',
@@ -288,7 +309,10 @@ os.environ["NMT_CONFIG"] = out_rel
 env_lines = [
     f'export REPO_DIR="{os.environ["REPO_DIR"]}"',
     f'export COMP_DATA_DIR="{os.environ["COMP_DATA_DIR"]}"',
+    f'export BYT5_VARIANT="{os.environ.get("BYT5_VARIANT", "base")}"',
+    f'export MODEL_DATASET="{os.environ.get("MODEL_DATASET", "")}"',
     f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
+    f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
     f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
@@ -350,7 +374,10 @@ os.environ["RUN_OCR"] = RUN_OCR
 env_lines = [
     f'export REPO_DIR="{os.environ["REPO_DIR"]}"',
     f'export COMP_DATA_DIR="{os.environ["COMP_DATA_DIR"]}"',
+    f'export BYT5_VARIANT="{os.environ.get("BYT5_VARIANT", "base")}"',
+    f'export MODEL_DATASET="{os.environ.get("MODEL_DATASET", "")}"',
     f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
+    f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
     f'export RUN_OCR="{os.environ["RUN_OCR"]}"',
@@ -445,7 +472,10 @@ os.environ["TRAIN_PATH"] = TRAIN_PATH
 env_lines = [
     f'export REPO_DIR="{os.environ["REPO_DIR"]}"',
     f'export COMP_DATA_DIR="{os.environ["COMP_DATA_DIR"]}"',
+    f'export BYT5_VARIANT="{os.environ.get("BYT5_VARIANT", "base")}"',
+    f'export MODEL_DATASET="{os.environ.get("MODEL_DATASET", "")}"',
     f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
+    f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ["TRAIN_PATH"]}"',
     f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
@@ -467,15 +497,11 @@ print("TRAIN_PATH:", os.environ["TRAIN_PATH"])
 %%bash
 source /content/colab_env.sh
 cd "$REPO_DIR"
-# ★モデル指定：
-# - Driveにbyt5-baseがあれば：--model-name-or-path "${MODEL_DIR}"
-# - 無ければ：configの model_name_or_path（google/byt5-base）を使うので --model-name-or-path は省略OK
+# ★モデル指定（base/large）:
+# - Drive にモデルがあればそれを優先（MODEL_DIR）
+# - 無ければ Hugging Face（google/byt5-<variant>）へフォールバック（Colab はネット接続できる想定）
 
-MODEL_ARG=""
-if [ -d "${MODEL_DIR}" ]; then
-  MODEL_ARG="--model-name-or-path ${MODEL_DIR}"
-fi
-
+MODEL_ARG="--model-name-or-path ${MODEL_NAME_OR_PATH}"
 python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}"   --train "${TRAIN_PATH}"   --variant C --drop-flagged   --out artifacts/nmt/byt5_small_colab   ${MODEL_ARG}   --post-eval-mode full   --save-val-preds --save-val-audit
 
 # 実行後、以下が `--out` 配下に保存されます:
@@ -611,11 +637,7 @@ PY
 %%bash
 source /content/colab_env.sh
 cd "$REPO_DIR"
-MODEL_ARG=""
-if [ -d "${MODEL_DIR}" ]; then
-  MODEL_ARG="--model-name-or-path ${MODEL_DIR}"
-fi
-
+MODEL_ARG="--model-name-or-path ${MODEL_NAME_OR_PATH}"
 python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}"   --train "${TRAIN_PATH}"   --variant C --drop-flagged   --out artifacts/nmt/byt5_small_colab_bf16   ${MODEL_ARG}   --post-eval-mode quick
 ```
 

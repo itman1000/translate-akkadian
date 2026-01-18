@@ -18,14 +18,19 @@ def main() -> None:
     allow_patterns = [
         "config.json",
         "generation_config.json",
+        "added_tokens.json",
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",
         "spiece.model",
         "vocab.json",
         "merges.txt",
-        "model.safetensors",
-        "pytorch_model.bin",
+        # safetensors（単体 or shard）+ index
+        "model*.safetensors",
+        "model*.safetensors.index.json",
+        # pytorch bin（単体 or shard）+ index
+        "pytorch_model*.bin",
+        "pytorch_model*.bin.index.json",
     ]
 
     try:
