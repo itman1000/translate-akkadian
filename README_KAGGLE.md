@@ -259,10 +259,10 @@ python -m dp.ocr_candidates --config configs/ocr.yaml --input "${COMP_DATA_DIR}/
 
 # （任意）行番号クリーニングを使う場合は以下に切り替え
 # python -m dp.clean_publications --config configs/ocr.yaml --input "${COMP_DATA_DIR}/publications.csv" --out artifacts/ocr/publications_clean.csv
-# python -m dp.ocr_candidates --config configs/ocr.yaml --input artifacts/ocr/publications_clean.csv
+# python -m dp.ocr_candidates --config configs/ocr.yaml --input artifacts/ocr/publications_clean.csv --text-col page_text_clean --overwrite
 
 # 候補 → ペア抽出 → 高品質のみ混合
-python -m dp.ocr_pairs --config configs/ocr.yaml
+python -m dp.ocr_pairs --config configs/ocr.yaml --overwrite
 python -m dp.mix_ocr --config configs/ocr.yaml --aligned artifacts/aligned/aligned_train.parquet
 ```
 
