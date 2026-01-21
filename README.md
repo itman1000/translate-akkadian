@@ -356,10 +356,65 @@ OOM の場合は `max_source_length`/`max_target_length` を下げるか、
 ByT5-large に切り替える場合は、`dp.train_nmt` に `--model-name-or-path google/byt5-large`（またはローカル保存パス）を付けて上書きしてください。  
 大きいモデルは VRAM が厳しいため、`per_device_train_batch_size=1`、`gradient_checkpointing=true`、`fp16/bf16=true` などを併用するのが無難です。
 
+### EvaCun 追加データの活用（事前学習/混合）
+
+ローカルでは `data/evacun_oracc_parallel_v0.1`、Colab/Drive では `/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1` に置いた並列コーパスを **事前学習** または **混合学習** に使えます。  
+基本方針は「EvaCun で事前学習 → コンペの aligned_train で微調整」です。
+
+1) EvaCun を学習用フォーマットに変換:
+```bash
+# 例:
+# - ローカル: data/evacun_oracc_parallel_v0.1
+# - Colab/Drive: /content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1
+python -m dp.prepare_evacun \
+  --data-dir /content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1 \
+  --src-lang transcription \
+  --variant C \
+  --out-dir artifacts/evacun
+```
+出力:
+- `artifacts/evacun/evacun_transcription_train.parquet`
+- `artifacts/evacun/evacun_transcription_val.parquet`
+※ 長文を抑えたい場合は `--max-sentence-endings 1` を追加してください（外せば全量）。
+
+2) 事前学習（EvaCun の train/val を使用）:
+```bash
+python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
+  --train artifacts/evacun/evacun_transcription_train.parquet \
+  --val artifacts/evacun/evacun_transcription_val.parquet \
+  --out artifacts/nmt/byt5_evacun_pre
+```
+
+3) 微調整（コンペ aligned_train に戻す）:
+```bash
+python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
+  --train artifacts/aligned/aligned_train.parquet --variant C --drop-flagged \
+  --out artifacts/nmt/byt5_evacun_ft \
+  --model-name-or-path artifacts/nmt/byt5_evacun_pre
+```
+
+4) 混合学習（任意・比率を振って比較）:
+```bash
+python -m dp.mix_evacun --config configs/nmt_byt5_small.yaml \
+  --aligned artifacts/aligned/aligned_train.parquet \
+  --evacun artifacts/evacun/evacun_transcription_train.parquet \
+  --out artifacts/evacun/mixed_train.parquet \
+  --ratio 0.3 --variants C
+
+python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
+  --train artifacts/evacun/mixed_train.parquet --variant C --drop-flagged \
+  --out artifacts/nmt/byt5_evacun_mix
+```
+※ `configs/nmt_byt5_small.yaml` の `val_exclude_sources` に `evacun` を入れておくと、  
+混合時でも **val がコンペ由来のみ** になり比較が安定します（設定済み）。
+※ 長文を抑える場合は `dp.mix_evacun` に `--max-sentence-endings 1` を追加してください。
+
 ### NMT 関連ファイルの役割
 - `configs/nmt_byt5_small.yaml`: NMT 学習/評価のデフォルト設定。検証分割（row/doc）やデコード、提出時の単文化設定をまとめています。
 - `src/dp/train_nmt.py`: NMT の学習と事後評価を担当します。`--config` と `--train` を読み込み、必要なら `--use-gloss` で辞書グロスを付与します。
 - `src/dp/nmt_ensemble.py`: 複数 ckpt の logits を平均してデコードするアンサンブル実装です（`dp.infer_nmt` の `--ckpts` で使用）。
+- `src/dp/prepare_evacun.py`: EvaCun の並列 txt を NMT 学習用の parquet/csv に変換します。
+- `src/dp/mix_evacun.py`: `aligned_train` と EvaCun を比率指定で混合します。
 
 ### 辞書グロス（eBL_Dictionary）による入力拡張（任意）
 

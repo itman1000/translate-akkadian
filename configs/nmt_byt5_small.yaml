@@ -8,7 +8,7 @@ seed: 42
 val_split_unit: doc           # 分割単位: row | doc
 val_doc_id_col: oare_id       # doc 分割時の文書ID列
 val_source_col: source        # 任意の列。例: aligned/ocr
-val_exclude_sources: [ocr]    # val から除外（trainには残す）
+val_exclude_sources: [ocr, evacun]    # val から除外（trainには残す）
 val_holdout_all_sources: true # true の場合、val 文書の全行を train から除外
 learning_rate: 0.0005
 num_train_epochs: 1

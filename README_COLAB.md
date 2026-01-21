@@ -100,10 +100,19 @@ MyDrive/kaggle_input/
     publications.csv
     published_texts.csv
     resources.csv
+    evacun_oracc_parallel_v0.1/
+    akkadian_train.txt
+    akkadian_validation.txt
+    english_train.txt
+    english_validation.txt
+    transcription_train.txt
+    transcription_validation.txt
 ```
 
 - 公式データ（train.csv / test.csv / sample_submission.csv …）
   - `/content/kaggle/input/deep-past-initiative-machine-translation`
+- （任意）EvaCun 追加データ
+  - `/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1`
 - （任意）ByT5（base/large）のローカル保存
   - `/content/kaggle/input/byt5-<variant>-model/byt5-<variant>`
 
@@ -118,8 +127,14 @@ BYT5_VARIANT="base"  # "large" も可
 # 公式データ（train.csv, test.csv があるディレクトリ）
 ln -sf "${DRIVE_DATA_ROOT}/deep-past-initiative-machine-translation"   /content/kaggle/input/deep-past-initiative-machine-translation
 
+# （任意）EvaCun 追加データ
+# Drive 直読みなら symlink は不要（EVACUN_DIR を Drive パスにする）
+# /content/kaggle/input で読みたい場合のみ symlink を作成:
+# ln -sf "${DRIVE_DATA_ROOT}/evacun_oracc_parallel_v0.1"   /content/kaggle/input/evacun_oracc_parallel_v0.1
+
 # 確認
 ls -la /content/kaggle/input/deep-past-initiative-machine-translation | head
+ls -la "${DRIVE_DATA_ROOT}/evacun_oracc_parallel_v0.1" | head || true
 ls -la "/content/kaggle/input/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}" 2>/dev/null | head || true
 ```
 
@@ -218,6 +233,12 @@ NMT_CONFIG = "configs/nmt_byt5_small.yaml"
 # 学習データ（既定は aligned_train）
 TRAIN_PATH = "artifacts/aligned/aligned_train.parquet"
 
+# EvaCun 追加データの場所（任意）
+EVACUN_DIR = "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1"
+
+# EvaCun 追加データを使うか（0=使わない / 1=使う）
+RUN_EVACUN = "0"
+
 # OCR 追加並列を使うか（0=使わない / 1=使う）
 RUN_OCR = "0"
 
@@ -229,6 +250,8 @@ os.environ["MODEL_DIR"] = MODEL_DIR
 os.environ["MODEL_NAME_OR_PATH"] = MODEL_NAME_OR_PATH
 os.environ["NMT_CONFIG"] = NMT_CONFIG
 os.environ["TRAIN_PATH"] = TRAIN_PATH
+os.environ["EVACUN_DIR"] = EVACUN_DIR
+os.environ["RUN_EVACUN"] = RUN_EVACUN
 os.environ["RUN_OCR"] = RUN_OCR
 os.environ["PYTHONPATH"] = f"{REPO_DIR}/src"
 
@@ -242,6 +265,8 @@ env_lines = [
     f'export MODEL_NAME_OR_PATH="{MODEL_NAME_OR_PATH}"',
     f'export NMT_CONFIG="{NMT_CONFIG}"',
     f'export TRAIN_PATH="{TRAIN_PATH}"',
+    f'export EVACUN_DIR="{EVACUN_DIR}"',
+    f'export RUN_EVACUN="{RUN_EVACUN}"',
     f'export RUN_OCR="{RUN_OCR}"',
     f'export PYTHONPATH="{REPO_DIR}/src"',
 ]
@@ -315,6 +340,8 @@ env_lines = [
     f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ.get("RUN_EVACUN", "0")}"',
     f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
     f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
 ]
@@ -380,11 +407,44 @@ env_lines = [
     f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ.get("RUN_EVACUN", "0")}"',
     f'export RUN_OCR="{os.environ["RUN_OCR"]}"',
     f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
 ]
 Path("/content/colab_env.sh").write_text("\n".join(env_lines) + "\n")
 print("RUN_OCR:", os.environ["RUN_OCR"])
+```
+
+---
+
+### セル 5-E：EvaCun 追加データを使う場合のフラグ（任意）
+EvaCun を使う場合は `RUN_EVACUN = "1"` にして実行してください。
+
+```python
+import os
+from pathlib import Path
+
+RUN_EVACUN = "1"
+os.environ["RUN_EVACUN"] = RUN_EVACUN
+
+# %%bash 用に環境変数を更新
+env_lines = [
+    f'export REPO_DIR="{os.environ["REPO_DIR"]}"',
+    f'export COMP_DATA_DIR="{os.environ["COMP_DATA_DIR"]}"',
+    f'export BYT5_VARIANT="{os.environ.get("BYT5_VARIANT", "base")}"',
+    f'export MODEL_DATASET="{os.environ.get("MODEL_DATASET", "")}"',
+    f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
+    f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
+    f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
+    f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ["RUN_EVACUN"]}"',
+    f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
+    f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
+]
+Path("/content/colab_env.sh").write_text("\n".join(env_lines) + "\n")
+print("RUN_EVACUN:", os.environ["RUN_EVACUN"])
 ```
 
 ---
@@ -454,6 +514,120 @@ python -m dp.mix_ocr --config configs/ocr.yaml --aligned artifacts/aligned/align
 - `artifacts/ocr_pairs/summary.json`
 - `artifacts/ocr_pairs/mixed_train.stats.json`
 
+#### 7-A2b) EvaCun 追加データの準備（任意）
+`セル 5-E` で `RUN_EVACUN="1"` にしてから実行してください。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+if [ "${RUN_EVACUN}" != "1" ]; then
+  echo "RUN_EVACUN=0: skip EvaCun flow"
+  exit 0
+fi
+
+# EvaCun の train/val を整形
+python -m dp.prepare_evacun \
+  --data-dir "${EVACUN_DIR}" \
+  --src-lang transcription \
+  --variant C \
+  --out-dir artifacts/evacun
+# 長文を抑える場合は --max-sentence-endings 1 を追加
+```
+
+出力:
+- `artifacts/evacun/evacun_transcription_train.parquet`
+- `artifacts/evacun/evacun_transcription_val.parquet`
+
+#### 7-A2c) EvaCun 事前学習（任意・推奨）
+EvaCun で事前学習し、その後 **コンペの `aligned_train` で微調整**する流れです。
+
+- **事前学習（このセル）**: EvaCun（`transcription → English`）でモデルの翻訳能力/語彙カバレッジを作る
+- **微調整（7-B）**: 事前学習済み ckpt を初期値にして、コンペの `aligned_train` で追加学習し「出力の癖/ドメイン」を寄せる
+- **EvaCun だけで学習する場合**: このセル（7-A2c）まででOKで、7-B は不要です
+
+`--post-eval-mode quick` は **指標（BLEU/chrF++/gm）だけ**を出す軽量モードです。  
+7-B の `full` は **指標 + サンプル/診断（崩壊チェック等）**まで出すため、時間が増えます。  
+※ `--save-val-preds` / `--save-val-audit` を使いたい場合は **`--post-eval-mode full` にしてください**（`quick` では保存されません）。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+MODEL_ARG="--model-name-or-path ${MODEL_NAME_OR_PATH}"
+python -m dp.train_nmt \
+  --config "${NMT_CONFIG}" \
+  --data-dir "${COMP_DATA_DIR}" \
+  --train artifacts/evacun/evacun_transcription_train.parquet \
+  --val artifacts/evacun/evacun_transcription_val.parquet \
+  --out artifacts/nmt/byt5_evacun_pre \
+  ${MODEL_ARG} \
+  --post-eval-mode quick
+```
+
+> **微調整（7-B）では `MODEL_ARG` を**  
+> `MODEL_ARG="--model-name-or-path artifacts/nmt/byt5_evacun_pre"`  
+> に切り替えて実行してください。
+
+#### 7-A2d) EvaCun 混合（任意）
+OCR 混合と同時には使わず、**どちらか一方を選んでください**。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+if [ "${RUN_EVACUN}" != "1" ]; then
+  echo "RUN_EVACUN=0: skip EvaCun mix"
+  exit 0
+fi
+
+python -m dp.mix_evacun \
+  --config "${NMT_CONFIG}" \
+  --aligned artifacts/aligned/aligned_train.parquet \
+  --evacun artifacts/evacun/evacun_transcription_train.parquet \
+  --out artifacts/evacun/mixed_train.parquet \
+  --ratio 0.3 --variants C
+# 長文を抑える場合は --max-sentence-endings 1 を追加
+```
+
+出力:
+- `artifacts/evacun/mixed_train.parquet`
+- `artifacts/evacun/mixed_train.stats.json`
+
+#### 7-A2e) 学習データを EvaCun 混合に切り替え（任意）
+```python
+import os
+from pathlib import Path
+
+TRAIN_PATH = "artifacts/aligned/aligned_train.parquet"
+mixed_path = Path(REPO_DIR) / "artifacts/evacun/mixed_train.parquet"
+if mixed_path.exists():
+    TRAIN_PATH = "artifacts/evacun/mixed_train.parquet"
+
+os.environ["TRAIN_PATH"] = TRAIN_PATH
+
+# %%bash 用に環境変数を更新
+env_lines = [
+    f'export REPO_DIR="{os.environ["REPO_DIR"]}"',
+    f'export COMP_DATA_DIR="{os.environ["COMP_DATA_DIR"]}"',
+    f'export BYT5_VARIANT="{os.environ.get("BYT5_VARIANT", "base")}"',
+    f'export MODEL_DATASET="{os.environ.get("MODEL_DATASET", "")}"',
+    f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
+    f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
+    f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
+    f'export TRAIN_PATH="{os.environ["TRAIN_PATH"]}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ.get("RUN_EVACUN", "0")}"',
+    f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
+    f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
+]
+Path("/content/colab_env.sh").write_text("\n".join(env_lines) + "\n")
+print("TRAIN_PATH:", os.environ["TRAIN_PATH"])
+```
+
 #### 7-A3) 学習データを OCR 混合に切り替え（任意）
 OCR を実行した場合は、学習データを `mixed_train.parquet` に切り替えます。
 
@@ -478,6 +652,8 @@ env_lines = [
     f'export MODEL_NAME_OR_PATH="{os.environ.get("MODEL_NAME_OR_PATH", os.environ.get("MODEL_DIR", ""))}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ["TRAIN_PATH"]}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ.get("RUN_EVACUN", "0")}"',
     f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
     f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
 ]
@@ -490,6 +666,7 @@ print("TRAIN_PATH:", os.environ["TRAIN_PATH"])
 - `dp.train_nmt` は、config の設定により **validation を OARE 由来の aligned 行だけから作成**します。
 - さらに `oare_id` 単位（doc 単位）で split することで、同一ドキュメントの文が train/val に跨らないようにしています。
 - OCR 混合（`mixed_train.parquet`）を使っても、**OCR 行は train のみに入り、val には入りません**。
+- EvaCun 混合でも **EvaCun 行は train のみに入り、val には入りません**（`val_exclude_sources` に `evacun` を含むため）。
 - split は `seed` で決まり、`--out` 配下に `val_doc_ids.json`（val に入った `oare_id` の一覧）が保存されます。
 
 #### 7-B) 学習（NMT）＋ validation 評価（BLEU / chrF++ / gm）
@@ -624,6 +801,8 @@ env_lines = [
     f'export MODEL_DIR="{os.environ["MODEL_DIR"]}"',
     f'export NMT_CONFIG="{os.environ["NMT_CONFIG"]}"',
     f'export TRAIN_PATH="{os.environ.get("TRAIN_PATH", "artifacts/aligned/aligned_train.parquet")}"',
+    f'export EVACUN_DIR="{os.environ.get("EVACUN_DIR", "/content/drive/MyDrive/kaggle_input/evacun_oracc_parallel_v0.1")}"',
+    f'export RUN_EVACUN="{os.environ.get("RUN_EVACUN", "0")}"',
     f'export RUN_OCR="{os.environ.get("RUN_OCR", "0")}"',
     f'export PYTHONPATH="{os.environ["REPO_DIR"]}/src"',
 ]
