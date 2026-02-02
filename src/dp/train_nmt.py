@@ -403,9 +403,16 @@ def filter_training_args(
     has_val: bool,
     total_steps: int,
 ) -> Dict[str, Any]:
+    kwargs = dict(kwargs)
+
+    # transformers のバージョン差分: evaluation_strategy -> eval_strategy
+    if "evaluation_strategy" not in supported and "eval_strategy" in supported:
+        if "evaluation_strategy" in kwargs and "eval_strategy" not in kwargs:
+            kwargs["eval_strategy"] = kwargs.get("evaluation_strategy")
+
     filtered = {k: v for k, v in kwargs.items() if k in supported}
 
-    if "evaluation_strategy" not in supported:
+    if "evaluation_strategy" not in supported and "eval_strategy" not in supported:
         if "evaluate_during_training" in supported:
             filtered["evaluate_during_training"] = bool(has_val)
         if "do_eval" in supported and has_val:

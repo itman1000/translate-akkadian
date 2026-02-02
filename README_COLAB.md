@@ -660,6 +660,8 @@ python -m dp.train_nmt \
   --data-dir "${COMP_DATA_DIR}" \
   --train artifacts/evacun/evacun_transcription_train.parquet \
   --val "${VAL_PATH}" \
+  --variant C \     #検証データを揃える場合
+  --drop-flagged \  #検証データを揃える場合
   --out artifacts/nmt/byt5_evacun_pre \
   ${MODEL_ARG} \
   --post-eval-mode quick
