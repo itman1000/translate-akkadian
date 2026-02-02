@@ -8,6 +8,122 @@ Kaggle Notebook では GPU が T4 / P100 などに限られますが、Google Co
 
 ---
 
+## Step 0: Oracle Upper Bound（+10 が理論的に可能か）
+上位を狙う施策の優先度付けのために、
+**1入力あたり多数候補を生成 → gold に最も近い候補を oracle 的に選択 → corpus gm を計算**して、
+「理論上どこまで伸び得るか」の上限をまず測ります。
+
+Colab（A100/H100）なら、val に対して beam n-best + sampling で
+**200〜500 候補/文**を作っても現実的に回せます。
+
+### 重要：`ID_COL` は「各行で一意」にする
+`dp.oracle_eval` は **`ID_COL` ごとに最良候補を 1つ**選ぶため、
+`ID_COL` が重複していると評価が壊れます（別行の候補/参照が混ざります）。
+
+たとえば `aligned_train` / `ablation/*/val.parquet` / `evacun_*_val.parquet` は
+1文書（`oare_id`）から複数行が生成されるため、`oare_id` が重複しやすいです。
+その場合は **oracle 用に `id=0..N-1` の連番を振った val ファイル**を作ってから実行してください。
+
+（例）候補生成 → oracle 評価（`CKPT_DIR` などはあなたの環境に合わせて変更）:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+export PYTHONPATH=src
+
+# ===== ここを自分の環境に合わせて変更 =====
+CFG="${NMT_CONFIG}"                      # 学習と同じ config を使うのが安全
+CKPT_DIR="artifacts/nmt/byt5_small_colab"  # 例（あなたの学習済みモデル）
+
+# 基本は train_nmt の --save-val-preds 出力を使うのが一番楽（src/ref が揃っている）
+BASE_VAL="artifacts/nmt/byt5_small_colab/val_predictions.csv"
+BASE_SRC_COL="src"
+BASE_GOLD_COL="ref"
+
+# val_predictions.csv が無い場合は、gold 付きの val（parquet/csv）を指定して OK
+# 例:
+# BASE_VAL="artifacts/ablation/variant=C/fold=0/val.parquet"
+# BASE_SRC_COL="src_sent"
+# BASE_GOLD_COL="tgt_sent"
+
+mkdir -p artifacts/oracle
+
+# oracle 用に「各行で一意な id」を付与した val を作る
+export BASE_VAL BASE_SRC_COL BASE_GOLD_COL
+python - <<'PY'
+import os
+from pathlib import Path
+
+import pandas as pd
+
+base = Path(os.environ["BASE_VAL"])
+src_col = os.environ["BASE_SRC_COL"]
+gold_col = os.environ["BASE_GOLD_COL"]
+
+if not base.exists():
+    raise SystemExit(f"ファイルが見つかりません: {base}")
+
+if base.suffix.lower() == ".parquet":
+    df = pd.read_parquet(base)
+else:
+    df = pd.read_csv(base)
+
+missing = [c for c in (src_col, gold_col) if c not in df.columns]
+if missing:
+    raise SystemExit(f"必要な列が見つかりません: {missing} (columns={list(df.columns)})")
+
+out = Path("artifacts/oracle/val_for_oracle.csv")
+out.parent.mkdir(parents=True, exist_ok=True)
+
+df = df.reset_index(drop=True).copy()
+df.insert(0, "id", df.index.astype(int))
+df = df.rename(columns={src_col: "src", gold_col: "ref"})
+df[["id", "src", "ref"]].to_csv(out, index=False)
+print("Saved:", out, "rows=", len(df))
+PY
+
+VAL_PATH="artifacts/oracle/val_for_oracle.csv"
+SRC_COL="src"
+ID_COL="id"
+GOLD_COL="ref"
+
+# beam 64 本
+python -m dp.infer_nmt_nbest \
+  --config "${CFG}" \
+  --ckpt "${CKPT_DIR}" \
+  --test "${VAL_PATH}" \
+  --src-col "${SRC_COL}" --id-col "${ID_COL}" \
+  --out artifacts/oracle/cands_beam64.csv \
+  --k 64 --num-beams 64 --tag beam64
+
+# sampling: 32 本×4 run = 128 本
+python -m dp.infer_nmt_nbest \
+  --config "${CFG}" \
+  --ckpt "${CKPT_DIR}" \
+  --test "${VAL_PATH}" \
+  --src-col "${SRC_COL}" --id-col "${ID_COL}" \
+  --out artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --do-sample --temperature 0.9 --top-p 0.95 \
+  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95
+
+# oracle upper bound
+python -m dp.oracle_eval \
+  --config "${CFG}" \
+  --gold "${VAL_PATH}" \
+  --id-col "${ID_COL}" --gold-text-col "${GOLD_COL}" \
+  --cands artifacts/oracle/cands_beam64.csv artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --out artifacts/oracle_eval
+
+cat artifacts/oracle_eval/metrics.json | head
+```
+
+出力:
+- `artifacts/oracle_eval/metrics.json`
+- `artifacts/oracle_eval/oracle_best.csv`
+
+---
+
 ## 0. 事前に決めること（おすすめ）
 
 ### Colab のランタイム

@@ -55,6 +55,103 @@ python -m dp.validate --submission submission.csv --data-dir data
 python -m dp.eval --pred submission.csv --gold <gold.csv>
 ```
 
+## Step 0: Oracle Upper Bound を測る（+10 が理論的に可能か）
+「モデル改善の余地がどれくらいあるか」を最短で見積もるために、
+**1入力あたり多数候補を生成 → gold に最も近い候補を oracle 的に選択 → corpus gm を計算**します。
+
+この近似 oracle が大きく伸びるなら、次の施策の期待値が高いです。
+- **多様なデコード + rerank**（n-best / sampling / diverse beams / 複数 ckpt）
+- **候補生成器と再ランキング器の分離**（2-stage）
+- **データ増強や合成データ**（上限を押し上げる）
+
+### 0-0) 重要：`ID_COL` は「各行で一意」にする
+`dp.oracle_eval` は **`ID_COL` ごとに最良候補を 1つ**選ぶため、
+`ID_COL` が重複していると評価が壊れます（別行の候補/参照が混ざります）。
+
+たとえば `aligned_train` / `ablation/*/val.parquet` / `evacun_*_val.parquet` は
+1文書（`oare_id`）から複数行が生成されるため、`oare_id` が重複しやすいです。
+その場合は **oracle 用に `id=0..N-1` の連番を振った val ファイル**を作ってから実行してください。
+
+例（oracle 用に `artifacts/oracle/val_for_oracle.csv` を作る）:
+```bash
+python - <<'PY'
+from pathlib import Path
+
+import pandas as pd
+
+base = Path("<VAL_CSV_OR_PARQUET>")
+src_col = "<SRC_COL>"
+gold_col = "<GOLD_COL>"
+
+if base.suffix.lower() == ".parquet":
+    df = pd.read_parquet(base)
+else:
+    df = pd.read_csv(base)
+
+out = Path("artifacts/oracle/val_for_oracle.csv")
+out.parent.mkdir(parents=True, exist_ok=True)
+
+df = df.reset_index(drop=True).copy()
+df.insert(0, "id", df.index.astype(int))
+df = df.rename(columns={src_col: "src", gold_col: "ref"})
+df[["id", "src", "ref"]].to_csv(out, index=False)
+print("Saved:", out, "rows=", len(df))
+PY
+```
+
+### 0-A) 候補を生成（beam n-best / sampling）
+`dp.infer_nmt_nbest` は 1行=1候補の long 形式 CSV を出力します。
+
+例（beam 64 本）:
+```bash
+export PYTHONPATH=src
+
+python -m dp.infer_nmt_nbest \
+  --config <NMT_CONFIG> \
+  --ckpt <CKPT_DIR> \
+  --test artifacts/oracle/val_for_oracle.csv \
+  --src-col src --id-col id \
+  --out artifacts/oracle/cands_beam64.csv \
+  --k 64 --num-beams 64 --tag beam64
+```
+
+例（sampling で 32 本×4 run = 128 本）:
+```bash
+python -m dp.infer_nmt_nbest \
+  --config <NMT_CONFIG> \
+  --ckpt <CKPT_DIR> \
+  --test artifacts/oracle/val_for_oracle.csv \
+  --src-col src --id-col id \
+  --out artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --do-sample --temperature 0.9 --top-p 0.95 \
+  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95
+```
+
+> 候補数は概ね `k × runs`（さらに ckpt を増やせばその分だけ増えます）。
+> VRAM が厳しいときは `--batch-size 1` に落としてください。
+
+### 0-B) Oracle を計算（候補から最良を選ぶ）
+`dp.oracle_eval` は候補 CSV を複数指定できます。
+
+```bash
+python -m dp.oracle_eval \
+  --config <NMT_CONFIG> \
+  --gold artifacts/oracle/val_for_oracle.csv \
+  --id-col id --gold-text-col ref \
+  --cands artifacts/oracle/cands_beam64.csv artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --out artifacts/oracle_eval
+```
+
+出力:
+- `artifacts/oracle_eval/metrics.json`（oracle gm / tag 別 top1 など）
+- `artifacts/oracle_eval/oracle_best.csv`（id ごとに oracle が選んだ best 候補）
+
+補足:
+- BLEU の tokenization は既定で sacrebleu の `13a` です（`--bleu-tokenize none` などで変更可）。
+- `--config` を渡すと、`dp.submit` と同じ出力正規化（`normalize_output`）や
+  1文制約（`force_single_sentence`）を oracle 側にも適用できます。
+
+
 ## 推論出力の表記ゆれ正規化
 `dp.infer_nmt` と `dp.submit` では、翻訳出力の表記ゆれを軽く正規化できます。
 主な処理内容:
