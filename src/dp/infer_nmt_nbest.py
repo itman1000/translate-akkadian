@@ -39,6 +39,12 @@ Sampling（確率的・複数 run）:
 - tag: 任意のラベル（後で候補プールを結合するため）
 - model: ckpt 識別子（複数 ckpt を同時に回す場合に区別）
 - translation: 生成文
+
+任意で forward の系列スコア（候補生成時の log-prob）を保存できます。
+`dp.eval_rerank_methods` の noisy-channel rerank で
+`--lambda-fwd` を使って合成スコア `rev + lambda*fwd` を試すときに便利です。
+
+- seq_score: 生成文の 1 token あたり平均 log-prob（高いほど良い）
 """
 
 from __future__ import annotations
@@ -139,6 +145,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=None, help="Nucleus sampling top_p.")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling.")
+
+    parser.add_argument(
+        "--save-forward-score",
+        action="store_true",
+        help="Save forward sequence score (avg log-prob per token) as 'seq_score'.",
+    )
 
     parser.add_argument("--max-rows", type=int, default=None, help="Use first N rows.")
     args = parser.parse_args()
@@ -261,7 +273,7 @@ def main() -> None:
         f"src_len={max_source_length} gen_limit={gen_limit} use_max_new_tokens={use_max_new_tokens} "
         f"beams={num_beams} len_penalty={length_penalty} early_stopping={early_stopping} "
         f"no_repeat_ngram={no_repeat_ngram_size} rep_penalty={repetition_penalty} "
-        f"temp={temperature} top_p={top_p} top_k={top_k}"
+        f"temp={temperature} top_p={top_p} top_k={top_k} save_fwd_score={bool(args.save_forward_score)}"
     )
 
     rows_out: list[dict[str, Any]] = []
@@ -348,10 +360,122 @@ def main() -> None:
                     else:
                         gen_kwargs["max_length"] = int(max_target_length)
 
-                    outputs = model.generate(**inputs, **gen_kwargs)
+                    if args.save_forward_score:
+                        gen_out = model.generate(
+                            **inputs,
+                            **gen_kwargs,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                        )
+                        outputs = gen_out.sequences
+                    else:
+                        outputs = model.generate(**inputs, **gen_kwargs)
+
                     # outputs: (batch*k, seq_len)
                     if not hasattr(outputs, "shape"):
                         raise RuntimeError("Unexpected generate() output type")
+
+                    # Forward score (avg log-prob per token) if requested.
+                    seq_scores: Optional[List[float]] = None
+                    if args.save_forward_score:
+                        try:
+                            # まずは HF のヘルパーで系列スコア（平均 log-prob）を計算する。
+                            # beam search では基本的にこれが動く想定（sampling でも version により動くことがある）。
+                            beam_idx = getattr(gen_out, "beam_indices", None)
+                            trans = model.compute_transition_scores(
+                                sequences=gen_out.sequences,
+                                scores=gen_out.scores,
+                                beam_indices=beam_idx,
+                                normalize_logits=True,
+                            )
+
+                            # Exclude decoder start token; count non-pad tokens.
+                            pad = int(pad_id if pad_id is not None else 0)
+                            seq = gen_out.sequences
+                            if seq.size(1) <= 1:
+                                lengths = torch.ones(seq.size(0), device=seq.device, dtype=torch.long)
+                            else:
+                                # NOTE: sampling + top-p/top-k の場合、
+                                #   - 終了後のトークンのスコアが -inf になりやすい
+                                #   - ( -inf * 0 ) が NaN になって合計が壊れる
+                                # ため、まず「有効トークン位置の mask」を作り、mask で 0 埋めしてから合計する。
+                                toks_full = seq[:, 1:]
+                                mask = toks_full != pad
+                                if eos_id is not None:
+                                    eos = int(eos_id)
+                                    eos_pos = toks_full == eos
+                                    csum = eos_pos.cumsum(dim=1)
+                                    before = csum == 0
+                                    first_eos = eos_pos & (csum == 1)
+                                    mask = mask & (before | first_eos)
+                                lengths = mask.sum(dim=1).clamp(min=1)
+                            # trans has shape (bsz*k, seq_len-1)
+                            if trans.size(1) > 0:
+                                # mask した位置は 0 にしてから合計（-inf*0 -> NaN を防ぐ）
+                                if seq.size(1) <= 1:
+                                    summed = torch.zeros(seq.size(0), device=seq.device, dtype=torch.float)
+                                else:
+                                    # 上で作った mask を使う（shape: (bsz*k, seq_len-1)）
+                                    trans_masked = trans.masked_fill(~mask, 0.0)
+                                    summed = trans_masked.sum(dim=1)
+                            else:
+                                summed = torch.zeros(seq.size(0), device=seq.device, dtype=torch.float)
+                            avg = (summed / lengths).detach().float().cpu().tolist()
+                            seq_scores = [float(x) for x in avg]
+                        except Exception as exc:
+                            # フォールバック: sampling/greedy（num_beams==1）の場合は、
+                            # beam の追跡なしで gen_out.scores から token の log-prob を直接計算する。
+                            try:
+                                if int(gen_kwargs.get("num_beams", 1)) != 1:
+                                    raise RuntimeError("fallback requires num_beams==1")
+                                import torch.nn.functional as F  # type: ignore
+
+                                pad = int(pad_id if pad_id is not None else 0)
+                                seq = gen_out.sequences
+                                scores = getattr(gen_out, "scores", None)
+                                if scores is None or len(scores) == 0:
+                                    raise RuntimeError("gen_out.scores is empty")
+
+                                T = len(scores)
+                                # 整列: scores[t] は sequences[:, t+1] の token を予測している想定
+                                toks = seq[:, 1 : 1 + T]
+                                if toks.size(1) < T:
+                                    pad_extra = torch.full(
+                                        (toks.size(0), T - toks.size(1)),
+                                        pad,
+                                        device=toks.device,
+                                        dtype=toks.dtype,
+                                    )
+                                    toks = torch.cat([toks, pad_extra], dim=1)
+                                elif toks.size(1) > T:
+                                    toks = toks[:, :T]
+
+                                step_logps = []
+                                for t, step_scores in enumerate(scores):
+                                    logp = F.log_softmax(step_scores, dim=-1)
+                                    tok = toks[:, t].clamp(min=0)
+                                    step_logps.append(logp.gather(1, tok.unsqueeze(1)).squeeze(1))
+                                logps = torch.stack(step_logps, dim=1)
+
+                                mask = toks != pad
+                                if eos_id is not None:
+                                    eos = int(eos_id)
+                                    eos_pos = toks == eos
+                                    csum = eos_pos.cumsum(dim=1)
+                                    before = csum == 0
+                                    first_eos = eos_pos & (csum == 1)
+                                    mask = mask & (before | first_eos)
+                                lengths = mask.sum(dim=1).clamp(min=1)
+                                # mask した位置は 0 にしてから合計（-inf*0 -> NaN を防ぐ）
+                                logps_masked = logps.masked_fill(~mask, 0.0)
+                                summed = logps_masked.sum(dim=1)
+                                avg = (summed / lengths).detach().float().cpu().tolist()
+                                seq_scores = [float(x) for x in avg]
+                            except Exception as exc2:
+                                # seq_score なしでも候補自体は出力する（ただし警告は出す）。
+                                print(f"[WARN] failed to compute forward seq_score: {type(exc).__name__}: {exc}")
+                                print(f"[WARN] fallback seq_score also failed: {type(exc2).__name__}: {exc2}")
+                                seq_scores = None
 
                     # safe decode: -100 が混ざる環境対策
                     if (outputs < 0).any():
@@ -371,6 +495,8 @@ def main() -> None:
                             "Falling back to min length."
                         )
                     take = min(len(decoded), expected)
+                    if seq_scores is not None:
+                        take = min(take, len(seq_scores))
 
                     for i, row_id in enumerate(batch_ids):
                         base = i * k
@@ -386,6 +512,7 @@ def main() -> None:
                                     "tag": full_tag,
                                     "model": model_name,
                                     "translation": decoded[j],
+                                    **({"seq_score": float(seq_scores[j])} if seq_scores is not None else {}),
                                 }
                             )
 

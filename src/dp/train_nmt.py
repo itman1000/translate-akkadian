@@ -1358,7 +1358,24 @@ def main() -> None:
 
     training_args = Seq2SeqTrainingArguments(**training_args_kwargs)
 
+    # transformers v5 で Seq2SeqTrainer の引数から tokenizer が削除されたため、
+    # v4/v5 両対応で受け付ける引数名（tokenizer / processing_class）を切り替える。
+    trainer_kwargs: dict[str, Any] = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_ds,
+        "eval_dataset": val_ds,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics,
+    }
+    trainer_init_params = set(inspect.signature(Seq2SeqTrainer.__init__).parameters)
+    if "processing_class" in trainer_init_params:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
     if step_decay_steps > 0 and step_decay_gamma > 0:
+
         class StepDecayTrainer(Seq2SeqTrainer):
             def __init__(self, step_size: int, gamma: float, **kwargs: Any) -> None:
                 self.step_decay_step_size = step_size
@@ -1378,24 +1395,10 @@ def main() -> None:
         trainer = StepDecayTrainer(
             step_size=step_decay_steps,
             gamma=step_decay_gamma,
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            data_collator=data_collator,
-            tokenizer=tokenizer,
-            compute_metrics=compute_metrics,
+            **trainer_kwargs,
         )
     else:
-        trainer = Seq2SeqTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            data_collator=data_collator,
-            tokenizer=tokenizer,
-            compute_metrics=compute_metrics,
-        )
+        trainer = Seq2SeqTrainer(**trainer_kwargs)
 
     train_result = trainer.train()
     trainer.save_model(str(out_dir))

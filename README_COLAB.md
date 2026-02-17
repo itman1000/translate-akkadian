@@ -34,10 +34,20 @@ export PYTHONPATH=src
 
 # ===== ここを自分の環境に合わせて変更 =====
 CFG="${NMT_CONFIG}"                      # 学習と同じ config を使うのが安全
-CKPT_DIR="artifacts/nmt/byt5_small_colab"  # 例（あなたの学習済みモデル）
+SAVE_NAME="byt5_small_colab_v1"          # 7-B0.6 で復元した名前（必要に応じて変更）
+DRIVE_LOCAL_DIR="/content/models/${SAVE_NAME}"
+
+if [ -d "${DRIVE_LOCAL_DIR}" ]; then
+  # Drive から /content に復元した場合はこちら
+  CKPT_DIR="${DRIVE_LOCAL_DIR}"
+  BASE_VAL="${DRIVE_LOCAL_DIR}/val_predictions.csv"
+else
+  # 同一セッションで学習した場合はこちら
+  CKPT_DIR="artifacts/nmt/byt5_small_colab"
+  BASE_VAL="${CKPT_DIR}/val_predictions.csv"
+fi
 
 # 基本は train_nmt の --save-val-preds 出力を使うのが一番楽（src/ref が揃っている）
-BASE_VAL="artifacts/nmt/byt5_small_colab/val_predictions.csv"
 BASE_SRC_COL="src"
 BASE_GOLD_COL="ref"
 
@@ -95,7 +105,8 @@ python -m dp.infer_nmt_nbest \
   --test "${VAL_PATH}" \
   --src-col "${SRC_COL}" --id-col "${ID_COL}" \
   --out artifacts/oracle/cands_beam64.csv \
-  --k 64 --num-beams 64 --tag beam64
+  --k 64 --num-beams 64 --tag beam64 \
+  --save-forward-score
 
 # sampling: 32 本×4 run = 128 本
 python -m dp.infer_nmt_nbest \
@@ -105,7 +116,8 @@ python -m dp.infer_nmt_nbest \
   --src-col "${SRC_COL}" --id-col "${ID_COL}" \
   --out artifacts/oracle/cands_sample_t0.9_p0.95.csv \
   --do-sample --temperature 0.9 --top-p 0.95 \
-  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95
+  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95 \
+  --save-forward-score
 
 # oracle upper bound
 python -m dp.oracle_eval \
@@ -243,6 +255,18 @@ BYT5_VARIANT="base"  # "large" も可
 # 公式データ（train.csv, test.csv があるディレクトリ）
 ln -sf "${DRIVE_DATA_ROOT}/deep-past-initiative-machine-translation"   /content/kaggle/input/deep-past-initiative-machine-translation
 
+# （任意）ByT5 を Drive に保存している場合は、/content/kaggle/input からも見えるように symlink を作成
+# ※ ln -s は「ディレクトリを作る」のではなく「既存パスへの参照」を作るだけなので、
+#    Drive 側に実体が無い場合は壊れたリンクになり、Python 側の Path(...).exists() は False になります。
+#
+# Drive 側の想定構成:
+#   ${DRIVE_DATA_ROOT}/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}/config.json ...
+#
+# /content/kaggle/input で読みたい場合のみ symlink を作成:
+if [ -d "${DRIVE_DATA_ROOT}/byt5-${BYT5_VARIANT}-model" ]; then
+  ln -sf "${DRIVE_DATA_ROOT}/byt5-${BYT5_VARIANT}-model"  "/content/kaggle/input/byt5-${BYT5_VARIANT}-model"
+fi
+
 # （任意）EvaCun 追加データ
 # Drive 直読みなら symlink は不要（EVACUN_DIR を Drive パスにする）
 # /content/kaggle/input で読みたい場合のみ symlink を作成:
@@ -251,6 +275,7 @@ ln -sf "${DRIVE_DATA_ROOT}/deep-past-initiative-machine-translation"   /content/
 # 確認
 ls -la /content/kaggle/input/deep-past-initiative-machine-translation | head
 ls -la "${DRIVE_DATA_ROOT}/evacun_oracc_parallel_v0.1" | head || true
+ls -la "${DRIVE_DATA_ROOT}/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}" 2>/dev/null | head || true
 ls -la "/content/kaggle/input/byt5-${BYT5_VARIANT}-model/byt5-${BYT5_VARIANT}" 2>/dev/null | head || true
 ```
 
@@ -962,6 +987,96 @@ python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}
 # - val_audit.csv       : ずれの型分類・診断列付き
 ```
 
+### 7-B0.5) 学習済みモデル`byt5_small_cola`を Google Drive に保存
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# ===== 好きな保存先に変えてください =====
+SAVE_NAME="byt5_small_colab_v1"
+DRIVE_DIR="/content/drive/MyDrive/translate-akkadian/artifacts/nmt/${SAVE_NAME}"
+
+SRC_DIR="${REPO_DIR}/artifacts/nmt/byt5_small_colab"
+mkdir -p "${DRIVE_DIR}"
+
+if command -v rsync >/dev/null 2>&1; then
+  time rsync -a --info=progress2 "${SRC_DIR}/" "${DRIVE_DIR}/"
+else
+  time cp -a "${SRC_DIR}/." "${DRIVE_DIR}/"
+fi
+
+du -sh "${DRIVE_DIR}" || true
+```
+
+### 7-B0.6) 7-B0.5で保存したモデルを読み込む
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# ===== 7-B0.5 と同じ名前に合わせてください =====
+SAVE_NAME="byt5_small_colab_v1"
+DRIVE_DIR="/content/drive/MyDrive/translate-akkadian/artifacts/nmt/${SAVE_NAME}"
+
+# /content 側に復元（学習・推論が速い）
+LOCAL_DIR="/content/models/${SAVE_NAME}"
+mkdir -p "${LOCAL_DIR}"
+
+if command -v rsync >/dev/null 2>&1; then
+  time rsync -a --info=progress2 "${DRIVE_DIR}/" "${LOCAL_DIR}/"
+else
+  time cp -a "${DRIVE_DIR}/." "${LOCAL_DIR}/"
+fi
+
+ls -la "${LOCAL_DIR}" | head
+
+# 以降のセルで使うパス例（/content 配下なので絶対パス推奨）
+# CKPT_DIR="${LOCAL_DIR}"
+# BASE_VAL="${LOCAL_DIR}/val_predictions.csv"
+```
+
+
+#### 7-B1) 学習済みモデル（例：`artifacts/nmt/byt5_reverse`）を Google Drive に保存（任意）
+学習中は `/content` 側に置くのが速いですが、セッション終了で消えるため、必要なら Drive にコピーしてください。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# 保存したいディレクトリ（例：質問の reverse ckpt）
+SRC_DIR="artifacts/nmt/byt5_reverse"
+
+# Drive 側の保存先（好きな場所でOK）
+DST_DIR="/content/drive/MyDrive/translate-akkadian/${SRC_DIR}"
+
+mkdir -p "$(dirname "${DST_DIR}")"
+rsync -a --info=progress2 "${SRC_DIR}/" "${DST_DIR}/"
+echo "saved: ${DST_DIR}"
+```
+
+#### 7-B2) Drive に保存したモデルを読み込む（任意）
+Drive から `/content` 側に復元して、そのまま `--reverse-ckpt` や `--ckpt` で使えます。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# Drive に保存したディレクトリ
+SRC_DIR="/content/drive/MyDrive/translate-akkadian/artifacts/nmt/byt5_reverse"
+
+# /content 側の復元先
+DST_DIR="artifacts/nmt/byt5_reverse"
+
+mkdir -p "${DST_DIR}"
+rsync -a --info=progress2 "${SRC_DIR}/" "${DST_DIR}/"
+echo "restored: ${DST_DIR}"
+```
+
+> 別モデルを使う場合は `SRC_DIR` / `DST_DIR` を対応するパスに変更してください。
+
 #### val_todo.csv（監査の「見る順」を作る：任意だがおすすめ）
 
 `val_audit.csv` から「前処理/後処理で直せそうな行」を優先度付きで抽出し、`val_todo.csv` を作れます。
@@ -1241,6 +1356,66 @@ python -m dp.infer_nmt \
 # gm を比較
 python -m dp.eval --pred artifacts/val_pred_norm.csv --gold artifacts/val_gold.csv
 python -m dp.eval --pred artifacts/val_pred_raw.csv --gold artifacts/val_gold.csv
+```
+
+---
+
+## 3.5 Step 0+：n-best 候補の選別（MBR / noisy channel）
+
+"Oracle Upper Bound" のように **1つの id あたり複数候補**（n-best）を作ってある場合、
+最終予測を 1 本に絞るための **候補選別（rerank/selection）**が効きます。
+
+この repo の `dp.eval_rerank_methods` は、同じ val 上で以下を比較する最小実験です。
+- **MBR(chrF++)**：候補どうしの chrF++ 類似度で合意を取る（逆モデル不要）
+- **Noisy channel（逆翻訳スコア）**：逆モデル（English→Akkadian）で `log p(src | pred)` を計算して選ぶ
+
+実行例（val と候補CSVが既にある前提）:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+python -m dp.eval_rerank_methods \
+  --config "${NMT_CONFIG}" \
+  --val artifacts/oracle/val_for_oracle.csv \
+  --id-col id --src-col src --gold-col ref \
+  --cands artifacts/oracle/cands_beam64.csv artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --run-mbr \
+  --run-noisy --reverse-ckpt artifacts/nmt/byt5_reverse \
+  --lambda-fwd-grid '0,0.5,1,2' \
+  --prune-strategy top_fwd --max-cands-per-id 96 \
+  --strip-lex-from-src \
+  --out artifacts/rerank_methods
+
+補足:
+- `--lambda-fwd-grid` は reverse の採点を **1回だけ**行い、λ を複数試します（追加コストほぼ無し）。
+- `--prune-strategy top_fwd` を使う場合は候補CSVに forward スコア列（例: `seq_score`）が必要です。
+  `dp.infer_nmt_nbest` の候補生成時に `--save-forward-score` を付けると `seq_score` が入ります。
+- forward スコア列に NaN が混じる場合は `-inf` として扱われます（候補生成の条件が揃っていない可能性が高いので、全候補CSVを `--save-forward-score` 付きで作り直してください）。
+- `--max-cands-per-id` は noisy-channel の reverse 採点対象だけを間引きます。
+  **MBR は候補全体で計算**されるため、MBR のスコア自体はここでは低下しません。
+  （最終的に「全部の候補で noisy を回す」場合は、`--max-cands-per-id` を外してください）
+```
+
+逆モデル（English→Akkadian）を学習する例（aligned_train の src/tgt を入れ替える）:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+MODEL_ARG="--model-name-or-path ${MODEL_NAME_OR_PATH}"
+
+# 逆モデル学習ではuse_gloss=False
+python -m dp.train_nmt \
+  --config "${NMT_CONFIG}" \
+  --data-dir "${COMP_DATA_DIR}" \
+  --train artifacts/aligned/aligned_train.parquet --variant C --drop-flagged \
+  --out artifacts/nmt/byt5_reverse \
+  ${MODEL_ARG} \
+  --src-col tgt_sent --tgt-col src_sent \
+  --post-eval-mode quick
 ```
 
 ---

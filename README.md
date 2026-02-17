@@ -15,6 +15,13 @@ Deep Past Challenge のための最小限のエンドツーエンドパイプラ
 - datasets（NMTで使用）
 - sentencepiece（NMTで使用）
 
+### 注意（transformers のバージョン差分）
+`transformers` v5 系では `Seq2SeqTrainer(..., tokenizer=...)` のような **`tokenizer` 引数が削除**されているため、
+古いコードだと `TypeError: Seq2SeqTrainer.__init__() got an unexpected keyword argument 'tokenizer'` が出ます。
+
+このリポジトリの `dp.train_nmt` は **v4/v5 両対応**（`processing_class` / `tokenizer` を自動判定）です。
+もし同じエラーが出る場合は、リポジトリを最新版にするか、暫定対応として `pip install "transformers<5"` を使ってください。
+
 ## ローカルセットアップ（venv）
 ```bash
 python3 -m venv .venv
@@ -102,6 +109,12 @@ PY
 ### 0-A) 候補を生成（beam n-best / sampling）
 `dp.infer_nmt_nbest` は 1行=1候補の long 形式 CSV を出力します。
 
+> **（おすすめ）** 後で Step 0+（MBR / noisy channel）や、
+> `rev + λ*fwd` のような合成スコアを試す予定があるなら、
+> 生成時に forward の系列スコアを保存しておくと楽です（`--save-forward-score`）。
+> これにより候補CSVに `seq_score` 列が追加され、後段で teacher forcing で採点し直す必要が減ります。
+> ※ `seq_score` は生成時の log-prob から計算する **ベストエフォート** です。環境/設定によっては計算できず、警告のうえ `seq_score` なしで候補だけ出力する場合があります。
+
 例（beam 64 本）:
 ```bash
 export PYTHONPATH=src
@@ -112,7 +125,8 @@ python -m dp.infer_nmt_nbest \
   --test artifacts/oracle/val_for_oracle.csv \
   --src-col src --id-col id \
   --out artifacts/oracle/cands_beam64.csv \
-  --k 64 --num-beams 64 --tag beam64
+  --k 64 --num-beams 64 --tag beam64 \
+  --save-forward-score
 ```
 
 例（sampling で 32 本×4 run = 128 本）:
@@ -124,7 +138,8 @@ python -m dp.infer_nmt_nbest \
   --src-col src --id-col id \
   --out artifacts/oracle/cands_sample_t0.9_p0.95.csv \
   --do-sample --temperature 0.9 --top-p 0.95 \
-  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95
+  --k 32 --runs 4 --seed 42 --tag sample_t0.9_p0.95 \
+  --save-forward-score
 ```
 
 > 候補数は概ね `k × runs`（さらに ckpt を増やせばその分だけ増えます）。
@@ -608,6 +623,66 @@ python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
 
 さらに高速化したい場合は、config に `post_eval_max_rows` を追加して **val をランダム間引き**できます（例：200〜500）。
 ※ 近似スコアになるため、採用判断は full（全件）で揃えて比較してください。
+
+### Step 0+：n-best 候補からの選別（MBR / noisy channel）
+
+"Oracle Upper Bound" のように **n-best 候補プール**（1つの id に対して複数翻訳候補）を作ってある場合、
+最終的に 1 本に絞るための **選別（rerank/selection）**が重要になります。
+
+この repo には、同一 val 上で以下を比較する最小実験スクリプトを追加しています：
+
+- **MBR(chrF++)**：候補どうしの chrF++ 類似度で "合意（consensus）" を取る（逆モデル不要）
+- **Noisy channel（逆翻訳スコア）**：逆モデル（English→Akkadian）で `log p(src | pred)` を計算して選ぶ
+
+実行例（val と候補CSVが既にある前提）:
+
+```bash
+export PYTHONPATH=src
+
+python -m dp.eval_rerank_methods \
+  --config configs/nmt_byt5_small.yaml \
+  --val artifacts/oracle/val_for_oracle.csv \
+  --id-col id --src-col src --gold-col ref \
+  --cands artifacts/oracle/cands_beam64.csv artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+  --run-mbr \
+  --run-noisy --reverse-ckpt artifacts/nmt/byt5_reverse \
+  --lambda-fwd-grid '0,0.5,1,2' \
+  --prune-strategy top_fwd --max-cands-per-id 96 \
+  --strip-lex-from-src \
+  --out artifacts/rerank_methods
+
+補足:
+- `--lambda-fwd-grid` は reverse の採点を **1回だけ**行い、λ を複数試します（追加コストほぼ無し）。
+- `--prune-strategy top_fwd` を使う場合は、候補CSVに forward スコア列（例: `seq_score`）が必要です。
+  `dp.infer_nmt_nbest` の候補生成時に `--save-forward-score` を付けると `seq_score` が入ります。
+- forward スコア列に NaN が混じる場合は `-inf` として扱われます（候補生成の条件が揃っていない可能性が高いので、全候補CSVを `--save-forward-score` 付きで作り直してください）。
+- `--max-cands-per-id` は noisy-channel の reverse 採点対象だけを間引きます。
+  **MBR は候補全体で計算**されるため、MBR のスコア自体はここでは低下しません。
+  （最終的に「全部の候補で noisy を回す」場合は、`--max-cands-per-id` を外してください）
+```
+
+出力:
+- `artifacts/rerank_methods/metrics.json`（MBR/noisy の BLEU/chrF++/gm）
+- `pred_mbr.csv`, `pred_noisy_channel.csv`
+- `noisy_scored_candidates.csv`（逆翻訳スコア付き、サイズ大きめ）
+
+#### 逆モデル（English→Akkadian）を学習する
+
+Noisy channel を回すには、**逆翻訳モデル**（入力: 英語、出力: アッカド語転写）が必要です。
+一番簡単なのは、既存の並列データ（`aligned_train` 等）で **src/tgt を入れ替えて学習**することです。
+
+例（`aligned_train.parquet` の `src_sent`/`tgt_sent` を想定）:
+
+```bash
+python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
+  --train artifacts/aligned/aligned_train.parquet --variant C --drop-flagged \
+  --out artifacts/nmt/byt5_reverse \
+  --src-col tgt_sent --tgt-col src_sent \
+  --post-eval-mode quick
+```
+
+※ forward と reverse で同じ前処理（正規化 variant / 単文化 / normalize_output など）を揃えると、
+cycle-consistency のシグナルが安定しやすいです。
 
 #### ずれの型分類（前処理・アラインの監査CSV）
 
