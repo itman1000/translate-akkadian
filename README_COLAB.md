@@ -818,7 +818,7 @@ source /content/colab_env.sh
 cd "$REPO_DIR"
 
 # ===== 好きな名前/保存先に変えてください =====
-PRETRAIN_NAME="byt5_evacun_pre_v1"
+PRETRAIN_NAME="byt5_evacun_pre_v2"
 DRIVE_PRETRAIN_DIR="/content/drive/MyDrive/translate-akkadian/models/${PRETRAIN_NAME}"
 
 SRC_DIR="${REPO_DIR}/artifacts/nmt/byt5_evacun_pre"
@@ -846,7 +846,7 @@ Drive 直読みより、`/content` にコピーしてから使う方が **読み
 source /content/colab_env.sh
 
 # ===== 7-A2c-1 で保存したパスに合わせてください =====
-PRETRAIN_NAME="byt5_evacun_pre_v1"
+PRETRAIN_NAME="byt5_evacun_pre_v2"
 DRIVE_PRETRAIN_DIR="/content/drive/MyDrive/translate-akkadian/models/${PRETRAIN_NAME}"
 
 LOCAL_PRETRAIN_DIR="/content/models/${PRETRAIN_NAME}"
@@ -863,7 +863,7 @@ ls -la "${LOCAL_PRETRAIN_DIR}" | head
 
 > **微調整（7-B）では `MODEL_ARG` を事前学習 ckpt に切り替えて実行してください。**  
 > - 同一セッション内でそのまま使う: `MODEL_ARG="--model-name-or-path artifacts/nmt/byt5_evacun_pre"`  
-> - Drive から復元して使う（推奨）: `MODEL_ARG="--model-name-or-path /content/models/byt5_evacun_pre_v1"`
+> - Drive から復元して使う（推奨）: `MODEL_ARG="--model-name-or-path /content/models/byt5_evacun_pre_v2"`
 
 #### 7-A2d) EvaCun 混合（任意）
 OCR 混合と同時には使わず、**どちらか一方を選んでください**。
@@ -987,7 +987,7 @@ python -m dp.train_nmt   --config "${NMT_CONFIG}"   --data-dir "${COMP_DATA_DIR}
 # - val_audit.csv       : ずれの型分類・診断列付き
 ```
 
-### 7-B0.5) 学習済みモデル`byt5_small_cola`を Google Drive に保存
+### 7-B0.5) 学習済みモデル`byt5_small_colab`を Google Drive に保存
 ```bash
 %%bash
 source /content/colab_env.sh
