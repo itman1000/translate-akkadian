@@ -136,6 +136,223 @@ cat artifacts/oracle_eval/metrics.json | head
 
 ---
 
+## Step 0+（改善策B）：編集モデル（Prototype Editing）で候補を増やす
+
+TM/近傍検索で得られる "近いが微妙に違う" 翻訳（プロトタイプ）を入力に付与して、
+gold 翻訳へ **編集**する seq2seq モデル（editor）を学習します。
+
+この editor が作る候補（`cands_editor.csv`）を既存の NMT 候補に足し、
+`dp.eval_rerank_methods`（MBR / noisy-channel）や学習リランカで回収するのが狙いです。
+
+### 重要（リーク対策）
+- **index（検索対象）は train のみで作る**（CV の場合は fold ごとに train だけ）
+- val/test を index に混ぜない
+
+### 0+1) editor 学習用データを作る（近傍検索→プロトタイプ付与）
+
+`dp.prepare_editor_data` は、(src,tgt) の並列データ（例: aligned_train）から
+TF-IDF char n-gram の近傍検索でプロトタイプを取得し、
+
+```
+<SRC> {src} <TM_SRC> {tm_src} <TM_TGT> {tm_tgt}
+```
+
+を入力として `editor_input` 列を作ります。
+
+> 計算量が重い場合は `--sample-rows` でサンプリングして、まず editor を小さく回すのが安全です。
+
+例（index も同時に保存する）:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+export PYTHONPATH=src
+
+# 例: aligned_train を editor データ化
+PAIRS="artifacts/aligned/aligned_train.parquet"
+
+mkdir -p artifacts/editor
+
+python -m dp.prepare_editor_data \
+  --pairs "${PAIRS}" \
+  --src-col src_sent --tgt-col tgt_sent \
+  --out artifacts/editor/editor_train.parquet \
+  --index-out artifacts/editor/proto_index.joblib \
+  --topk 10 --prototypes-per-src 2 \
+  --min-sim 0.25 \
+  --exclude-self \
+  --min-len-ratio 0.5 --max-len-ratio 2.0
+```
+
+### 0+2) editor を学習する
+
+ベースモデルは ByT5（NMT と同じでOK）からの微調整を想定しています。
+
+例:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+export PYTHONPATH=src
+
+FWD_CKPT="/content/models/byt5_small_colab_v1"
+
+# NMT と同じ config を流用して OK（max_source_length は editor 入力が長いので少し大きめ推奨）
+python -m dp.train_editor \
+  --config "${NMT_CONFIG}" \
+  --train artifacts/editor/editor_train.parquet \
+  --model-name-or-path "${FWD_CKPT}" \
+  --out-dir artifacts/editor_model/byt5_editor_v1 \
+  --max-source-length 512 \
+  --max-target-length 384 \
+  --per-device-train-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --num-train-epochs 3 \
+  --learning-rate 5e-4 \
+  --bf16
+```
+
+#### 0+2a) 学習済み editor モデルを Google Drive に保存（任意）
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# ===== 好きな名前/保存先に変えてください =====
+SAVE_NAME="byt5_editor_v1"
+SRC_DIR="artifacts/editor_model/byt5_editor_v1"
+DRIVE_DIR="/content/drive/MyDrive/translate-akkadian/artifacts/editor_model/${SAVE_NAME}"
+
+if [ ! -d "${SRC_DIR}" ]; then
+  echo "[ERROR] source model dir not found: ${SRC_DIR}" >&2
+  exit 1
+fi
+
+mkdir -p "${DRIVE_DIR}"
+if command -v rsync >/dev/null 2>&1; then
+  time rsync -a --info=progress2 "${SRC_DIR}/" "${DRIVE_DIR}/"
+else
+  time cp -a "${SRC_DIR}/." "${DRIVE_DIR}/"
+fi
+
+du -sh "${DRIVE_DIR}" || true
+```
+
+#### 0+2b) Drive の editor モデルを /content に読み出す（推奨）
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+# ===== 0+2a と同じ名前/保存先に合わせてください =====
+SAVE_NAME="byt5_editor_v1"
+DRIVE_DIR="/content/drive/MyDrive/translate-akkadian/artifacts/editor_model/${SAVE_NAME}"
+
+# /content 側に復元（推論が速い）
+LOCAL_DIR="/content/models/${SAVE_NAME}"
+
+if [ ! -d "${DRIVE_DIR}" ]; then
+  echo "[ERROR] drive model dir not found: ${DRIVE_DIR}" >&2
+  exit 1
+fi
+
+mkdir -p "${LOCAL_DIR}"
+if command -v rsync >/dev/null 2>&1; then
+  time rsync -a --info=progress2 "${DRIVE_DIR}/" "${LOCAL_DIR}/"
+else
+  time cp -a "${DRIVE_DIR}/." "${LOCAL_DIR}/"
+fi
+
+ls -la "${LOCAL_DIR}" | head
+
+# 以降のセルで使う ckpt パス例:
+# EDITOR_CKPT="${LOCAL_DIR}"
+```
+
+### 0+3) editor で候補 CSV（long）を生成する
+
+val（oracle 用）に対して editor 候補を生成し、既存の候補と結合して rerank します。
+
+#### 重要（noisy-channel を厳密にする場合）
+`dp.eval_rerank_methods --prune-strategy top_fwd` や noisy-channel の `lambda>0` は
+候補の `seq_score`（forward スコア）を比較して使います。
+
+editor 候補は **editor モデル自身の確率**と、NMT（前向き）モデルの確率が
+スケール的に一致しないことがあるため、**厳密にやるなら editor 候補も同じ forward ckpt で teacher forcing 再スコア**するのがおすすめです。
+
+その場合は `dp.infer_editor_nbest` に `--fwd-ckpt` を渡してください。
+（このとき出力CSVには NMT forward で付け直した `seq_score` が入り、
+元の editor 生成スコアは `editor_seq_score` として保持されます。）
+
+例:
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+export PYTHONPATH=src
+
+VAL_PATH="artifacts/oracle/val_for_oracle.csv"
+
+# NMT 候補（beam/sample）を作った forward ckpt と同じものを指定してください
+# 例: /content/models/<SAVE_NAME> か artifacts/nmt/<SAVE_NAME> など
+FWD_CKPT="/content/models/byt5_small_colab_v1"  # まだ CKPT_DIR が無い場合はここにパスを直書き
+
+# editor ckpt（Drive から復元済みなら /content/models 側を優先）
+EDITOR_CKPT="/content/models/byt5_editor_v1"
+if [ ! -d "${EDITOR_CKPT}" ]; then
+  EDITOR_CKPT="artifacts/editor_model/byt5_editor_v1"
+fi
+
+python -m dp.infer_editor_nbest \
+  --config "${NMT_CONFIG}" \
+  --ckpt "${EDITOR_CKPT}" \
+  --fwd-ckpt "${FWD_CKPT}" \
+  --index artifacts/editor/proto_index.joblib \
+  --test "${VAL_PATH}" \
+  --src-col src --id-col id \
+  --out artifacts/oracle/cands_editor.csv \
+  --topk 10 \
+  --k 4 --num-beams 4 \
+  --tag editor \
+  --save-forward-score \
+  --force-single-sentence --single-sentence-mode merge
+```
+
+### 0+4) 既存候補に editor 候補を足して rerank する
+
+`dp.eval_rerank_methods` の `--cands` に `cands_editor.csv` を追加します。
+
+```bash
+%%bash
+source /content/colab_env.sh
+cd "$REPO_DIR"
+
+python -m dp.eval_rerank_methods \
+  --config "${NMT_CONFIG}" \
+  --val artifacts/oracle/val_for_oracle.csv \
+  --id-col id --src-col src --gold-col ref \
+  --cands \
+    artifacts/oracle/cands_beam64.csv \
+    artifacts/oracle/cands_sample_t0.9_p0.95.csv \
+    artifacts/oracle/cands_tmpp_top50.csv \
+    artifacts/oracle/cands_editor.csv \
+  --run-noisy \
+  --run-mbr \
+  --reverse-ckpt artifacts/nmt/byt5_reverse_evacun \
+  --fwd-score-col seq_score --lambda-fwd-grid 0,0.5,1,2,3,4 \
+  # editor 候補も残したい場合は max-cands-per-id を増やしてください（例: 192+editor分）
+  --prune-strategy top_fwd --max-cands-per-id 300 \
+  --strip-lex-from-src \
+  --out artifacts/rerank_methods_with_editor
+```
+
+---
+
 ## 0. 事前に決めること（おすすめ）
 
 ### Colab のランタイム
@@ -818,7 +1035,7 @@ source /content/colab_env.sh
 cd "$REPO_DIR"
 
 # ===== 好きな名前/保存先に変えてください =====
-PRETRAIN_NAME="byt5_evacun_pre_v2"
+PRETRAIN_NAME="byt5_evacun_pre_v1"
 DRIVE_PRETRAIN_DIR="/content/drive/MyDrive/translate-akkadian/models/${PRETRAIN_NAME}"
 
 SRC_DIR="${REPO_DIR}/artifacts/nmt/byt5_evacun_pre"
@@ -846,7 +1063,7 @@ Drive 直読みより、`/content` にコピーしてから使う方が **読み
 source /content/colab_env.sh
 
 # ===== 7-A2c-1 で保存したパスに合わせてください =====
-PRETRAIN_NAME="byt5_evacun_pre_v2"
+PRETRAIN_NAME="byt5_evacun_pre_v1"
 DRIVE_PRETRAIN_DIR="/content/drive/MyDrive/translate-akkadian/models/${PRETRAIN_NAME}"
 
 LOCAL_PRETRAIN_DIR="/content/models/${PRETRAIN_NAME}"
@@ -863,7 +1080,7 @@ ls -la "${LOCAL_PRETRAIN_DIR}" | head
 
 > **微調整（7-B）では `MODEL_ARG` を事前学習 ckpt に切り替えて実行してください。**  
 > - 同一セッション内でそのまま使う: `MODEL_ARG="--model-name-or-path artifacts/nmt/byt5_evacun_pre"`  
-> - Drive から復元して使う（推奨）: `MODEL_ARG="--model-name-or-path /content/models/byt5_evacun_pre_v2"`
+> - Drive から復元して使う（推奨）: `MODEL_ARG="--model-name-or-path /content/models/byt5_evacun_pre_v1"`
 
 #### 7-A2d) EvaCun 混合（任意）
 OCR 混合と同時には使わず、**どちらか一方を選んでください**。

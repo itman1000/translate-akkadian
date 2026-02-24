@@ -1040,6 +1040,8 @@ bash scripts/build_llm_bundle.sh
 
 ## トラブルシューティング
 - `train_nmt.py` の `split_train_val` 実行時に `NameError: random is not defined` が出る場合は、最新版に更新してください（修正済み）。
+- `dp.train_editor` 実行時に `TypeError: Seq2SeqTrainingArguments.__init__() got an unexpected keyword argument 'evaluation_strategy'` が出る場合、`transformers` の版差が原因です。最新版では `evaluation_strategy` / `eval_strategy` の差分を自動吸収するよう修正済みです。
+- `dp.infer_editor_nbest` 実行時に `ValueError: The truth value of a DataFrame is ambiguous` が出る場合、`proto_index.joblib` の `meta` 読み込み時の真偽値評価が原因です。最新版では `meta/meta_df/df` を `None` 判定で順に読む実装に修正済みです。
 
 ## リポジトリ構成（最小）
 - `src/dp/` : CLI エントリポイント（`train`, `infer`, `submit`, `validate`, `eval`）
