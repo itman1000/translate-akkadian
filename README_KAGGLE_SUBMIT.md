@@ -75,23 +75,20 @@ Kaggle で **New Notebook** を作り、`Data` から以下を追加します。
 
 ## 2. Notebook（セル）: セットアップ
 
-### セル 1：リポジトリを展開
+### セル 1：リポジトリをコピー
 ```bash
 %%bash
 set -eux
 
-# Dataタブの dataset 名に合わせて修正
-REPO_DATASET="translate-akkadian"   # 例: あなたの repo dataset 名
-ZIP_PATH="/kaggle/input/${REPO_DATASET}/translate-akkadian.zip"
+SRC="/kaggle/input/datasets/vashi1000/kaggle-bundle/translate-akkadian"
+DST="/kaggle/working/repo/translate-akkadian"
 
 mkdir -p /kaggle/working/repo
-unzip -q "${ZIP_PATH}" -d /kaggle/working/repo
+rm -rf "$DST"
+cp -a "$SRC" "$DST"
 
-ls -la /kaggle/working/repo
-ls -la /kaggle/working/repo/translate-akkadian | head
+ls -la "$DST" | head
 ```
-
-> zip ではなくフォルダで入っている場合は `unzip` を省略し、`REPO_DIR` を実パスに合わせてください。
 
 ### セル 2：共通 env を作る（重要）
 `%%bash` セルは「セルごとに別プロセス」なので、毎回パスを打ち直さないよう  
@@ -115,40 +112,178 @@ export PYTHONPATH="${REPO_DIR}/src"
 export COMP_DATA_DIR="/kaggle/input/deep-past-initiative-machine-translation"  # Dataタブに合わせて修正
 
 # ===== 学習済みモデル Dataset =====
-export MODEL_DATASET="my-akkadian-models"   # Dataタブに合わせて修正
-export FWD_CKPT="/kaggle/input/${MODEL_DATASET}/fwd"   # forward(Akkadian->English)
-export REV_CKPT="/kaggle/input/${MODEL_DATASET}/rev"   # reverse(English->Akkadian)
+export FWD_CKPT="/kaggle/working/models/byt5_small_colab_v1"   # forward(Akkadian->English)
+export REV_CKPT="/kaggle/working/byt5-reverse/byt5_reverse_evacun"   # reverse(English->Akkadian)
+
 
 # ===== config =====
-export CFG="${REPO_DIR}/configs/nmt_byt5_small.yaml"   # 学習時に使っていた config に合わせて修正
+export NMT_CONFIG="configs/nmt_byt5_small.yaml"   # 学習時に使っていた config に合わせて修正（REPO_DIR からの相対パス）
+export CFG="${REPO_DIR}/${NMT_CONFIG}"
 EOF
 
 mkdir -p /kaggle/working/hf
 cat /kaggle/working/kaggle_env.sh
 ```
 
+### セル 2.5：config を Notebook 上で上書きする（任意）
+**セル 2 の直後、セル 3 の前**で実行してください。  
+このセルは先に `kaggle_env.sh` を **Python 側の `os.environ` に読み込んでから** 実行します。  
+`%%bash` で `export` した環境変数は Python カーネルには自動では引き継がれないため、この読み込みが必要です。  
+また、このセルは `kaggle_env.sh` の `NMT_CONFIG` / `CFG` も更新するので、以後の `%%bash` セルでそのまま反映されます。
+
+```python
+import json
+import os
+import sys
+from pathlib import Path
+
+# bash セルで作成した export を Python カーネルへ反映する
+env_path = Path("/kaggle/working/kaggle_env.sh")
+if not env_path.exists():
+    raise FileNotFoundError(f"env file not found: {env_path}")
+
+for raw_line in env_path.read_text().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or not line.startswith("export "):
+        continue
+    key, value = line[len("export ") :].split("=", 1)
+    value = value.strip().strip('"').strip("'")
+    os.environ[key] = os.path.expandvars(value)
+
+sys.path.append(f'{os.environ["REPO_DIR"]}/src')
+from dp.utils import load_config
+
+repo_dir = Path(os.environ["REPO_DIR"])
+default_base_rel = "configs/nmt_byt5_small.yaml"
+base_rel = os.environ.get("NMT_CONFIG", default_base_rel)
+base_path = Path(base_rel)
+if not base_path.is_absolute():
+    base_path = repo_dir / base_path
+
+# 2.5 を再実行した場合、NMT_CONFIG が override JSON を指したままになることがある。
+# そのファイルがまだ無ければ、元の yaml へフォールバックする。
+if not base_path.exists():
+    fallback_path = repo_dir / default_base_rel
+    print("base config missing, fallback to:", fallback_path)
+    base_path = fallback_path
+
+cfg = load_config(str(base_path))
+
+# 提出 Notebook で実際に効くのは主に推論・後処理系の設定
+cfg.update({
+    "max_source_length": 384,
+    "max_target_length": 384,
+    "generation_max_length": 320,
+    "generation_max_new_tokens": 320,
+    "infer_batch_size": 4,
+    "num_beams": 4,
+    "length_penalty": 0.8,
+    "repetition_penalty": 1.15,
+    "no_repeat_ngram_size": 20,
+    "use_gloss": False,
+    "gloss_max_hints": 6,
+    "gloss_max_total_chars": 220,
+    "gloss_max_match_len": 4,
+    "gloss_max_lemma_freq": 1000000,
+    "force_single_sentence": True,
+    "single_sentence_mode": "merge",
+    "normalize_output": False,
+    "data_dir": os.environ["COMP_DATA_DIR"],
+})
+
+out_rel = "configs/nmt_byt5_small.kaggle.override.json"
+out_path = repo_dir / out_rel
+out_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+print("wrote:", out_path)
+
+# 現在の Python カーネルでも上書き後の config を参照できるようにする
+os.environ["NMT_CONFIG"] = out_rel
+os.environ["CFG"] = str(out_path)
+
+# 以後の %%bash セル用に env ファイルも更新する
+env_lines = env_path.read_text().splitlines()
+env_lines = [
+    ln
+    for ln in env_lines
+    if not ln.startswith("export NMT_CONFIG=") and not ln.startswith("export CFG=")
+]
+env_lines.append(f'export NMT_CONFIG="{out_rel}"')
+env_lines.append('export CFG="${REPO_DIR}/${NMT_CONFIG}"')
+env_path.write_text("\n".join(env_lines) + "\n")
+print("updated:", env_path)
+```
+
+補足:
+- 提出 Notebook では、`num_train_epochs` / `learning_rate` / `per_device_train_batch_size` / `gradient_accumulation_steps` / `dropout_rate` / `fp16` / `bf16` のような**学習専用設定は基本的に効きません**。
+- 推論で OOM を避けたい場合は `per_device_eval_batch_size` ではなく **`infer_batch_size`** を下げてください。
+- rerank の reverse 採点側は config ではなく、セル B2 の `--noisy-batch-size` を下げる方が直接効きます。
+- 例のセルでは `--norm-variant C` や `--num-beams 8` のように **CLI で明示指定している値が config より優先**されます。そこも変えたい場合は後続セルの引数も合わせて編集してください。
+
 ### セル 3：必要パッケージの確認（※基本は Kaggle 標準で足りる想定）
-オフライン提出を想定すると、`pip install` は避けたいです。  
-まずは import が通るか確認してください。
+オフライン提出を想定すると、インターネットに依存する `pip install` は避けたいです。  
+まずは import が通るか確認してください（`sacrebleu` は**評価用の任意依存**です）。
 
 ```python
 import importlib
 
-pkgs = ["pandas","sklearn","pyarrow","torch","transformers","datasets","sentencepiece","sacrebleu"]
-missing = []
-for p in pkgs:
+# 必須（提出ファイル生成に必要）
+required = ["pandas","sklearn","pyarrow","torch","transformers","datasets","sentencepiece"]
+
+# 任意（BLEU/chrF++ などのローカル評価ログ用。提出だけなら無くてもOK）
+optional = ["sacrebleu"]
+
+missing_required = []
+for p in required:
     try:
         importlib.import_module(p)
     except Exception:
-        missing.append(p)
+        missing_required.append(p)
 
-print("missing:", missing)
+missing_optional = []
+for p in optional:
+    try:
+        importlib.import_module(p)
+    except Exception:
+        missing_optional.append(p)
+
+print("missing_required:", missing_required)
+print("missing_optional:", missing_optional)
 ```
 
-- `missing` が空なら OK  
-- もし欠けている場合：
-  - 開発中のみ Internet=ON で `pip install -r requirements.txt` して動作確認 →  
-    **提出用には Internet=OFF にしても動く状態**にする（Kaggle の再実行で弾かれるケースがあるため）
+- `missing_required` が空なら OK（提出処理は進められます）  
+- `missing_optional` に `sacrebleu` だけが入るのは OK（評価指標の表示がスキップされるだけ）  
+- `missing_required` がある場合は、提出（Internet=OFF）環境で動くように依存を揃えてください（オンライン `pip install` はできません）
+
+
+### セル3.5 : モデルのファイル名修正措置
+```bash
+%%bash
+set -eux
+
+SRC_DIR="/kaggle/input/datasets/vashi1000/models/byt5_small_colab_v1"
+DST_DIR="/kaggle/working/models/byt5_small_colab_v1"
+
+mkdir -p "$DST_DIR"
+cp -a "$SRC_DIR/." "$DST_DIR/"
+
+mv "$DST_DIR/model-001.safetensors" "$DST_DIR/model.safetensors"
+ls -la "$DST_DIR" | head
+
+```
+
+```bash
+%%bash
+set -eux
+
+SRC_DIR="/kaggle/input/datasets/vashi1000/byt5-reverse/byt5_reverse_evacun"
+DST_DIR="/kaggle/working/byt5-reverse/byt5_reverse_evacun"
+
+mkdir -p "$DST_DIR"
+cp -a "$SRC_DIR/." "$DST_DIR/"
+
+mv "$DST_DIR/model-001.safetensors" "$DST_DIR/model.safetensors"
+ls -la "$DST_DIR" | head
+```
 
 ### セル 4：パス存在チェック（任意）
 ```bash
@@ -174,6 +309,12 @@ PY
 まずは **提出が通ること**を確認したい時の最短ルートです。
 
 #### セル A1：推論 → submission.csv
+> 重要（gloss あり学習の場合）  
+> forward モデルのディレクトリに `train_meta.json` があり、その中の `gloss.enabled=true` になっている場合、  
+> そのモデルは **辞書グロス（<LEX>...）付きで学習**されています。  
+> この場合は **推論でも同じ gloss 付与**をするのが基本で、`dp.infer_nmt` / `dp.infer_nmt_nbest` は
+> `train_meta.json` を見て **自動で gloss を有効化**します（無効化したい場合は `--no-gloss`）。
+
 ```bash
 %%bash
 set -eux
@@ -252,6 +393,10 @@ python -m dp.infer_nmt_nbest \
 #### セル B2：noisy-channel rerank（reverse スコア + 0.5 * forward スコア）
 `dp.eval_rerank_methods` は本来 validation 用ですが、test 用に「ダミー gold」を作って流用します。  
 （gold は空文字で OK。スコアは意味を持ちませんが、`pred_noisy_channel.csv` が得られます）
+
+> Kaggle の提出環境では `sacrebleu` が無いことがあります。  
+> この場合も **noisy-channel rerank 自体は実行され、metrics は skip されるだけ**です。  
+> test 提出用途では `--lambda-fwd 0.5` のように **固定 λ** を使ってください。
 
 ```bash
 %%bash
@@ -394,4 +539,3 @@ cat /kaggle/working/val_rerank_out/metrics.json | head
   → `--noisy-batch-size` や `infer_nmt_nbest --batch-size` を下げる / `k` を下げる。
 - 提出で弾かれる（Internet が原因）  
   → Notebook の Internet を OFF にして Commit し直す（提出用は基本オフライン想定）。
-

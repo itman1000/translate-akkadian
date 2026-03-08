@@ -169,6 +169,24 @@ def build_postprocess(cfg: Dict[str, Any]):
     return _pp
 
 
+def maybe_compute_metrics(
+    hypotheses: List[str],
+    references: List[str],
+) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    """評価不能な環境では metrics を安全にスキップする。"""
+
+    if not any(str(ref).strip() for ref in references):
+        return None, "gold が空のため metrics を計算しません"
+    try:
+        return compute_metrics(hypotheses, references), None
+    except RuntimeError as exc:
+        if "sacrebleu" in str(exc).lower():
+            return None, "sacrebleu が無いため metrics を計算しません"
+        raise
+    except ImportError:
+        return None, "sacrebleu が無いため metrics を計算しません"
+
+
 _LEX_RE = re.compile(r"<LEX>.*?</LEX>", flags=re.DOTALL | re.IGNORECASE)
 
 
@@ -525,9 +543,19 @@ def main() -> None:
             chosen[sid] = (texts[idx], util, tags[idx])
 
         preds = [chosen.get(s, ("", 0.0, ""))[0] for s in ids_order]
-        m = compute_metrics(preds, gold_list)
-        metrics_out["mbr"] = {"bleu": m["bleu"], "chrf": m["chrf"], "gm": m["score"]}
-        print(f"[mbr_chrF++] bleu={m['bleu']:.4f} chrf={m['chrf']:.4f} gm={m['score']:.4f}")
+        m, metrics_skip_reason = maybe_compute_metrics(preds, gold_list)
+        if m is None:
+            metrics_out["mbr"] = {
+                "bleu": None,
+                "chrf": None,
+                "gm": None,
+                "metrics_skipped": True,
+                "metrics_skip_reason": metrics_skip_reason,
+            }
+            print(f"[mbr_chrF++] metrics skipped ({metrics_skip_reason})")
+        else:
+            metrics_out["mbr"] = {"bleu": m["bleu"], "chrf": m["chrf"], "gm": m["score"]}
+            print(f"[mbr_chrF++] bleu={m['bleu']:.4f} chrf={m['chrf']:.4f} gm={m['score']:.4f}")
 
         mbr_df = pd.DataFrame(
             {
@@ -656,6 +684,10 @@ def main() -> None:
             best_lambda = None
             best_preds: List[str] = []
             best_rows: Optional[pd.DataFrame] = None
+            metrics_enabled = any(str(ref).strip() for ref in gold_list)
+            metrics_skip_reason: Optional[str] = None
+            if not metrics_enabled:
+                metrics_skip_reason = "gold が空のため metrics を計算しません"
 
             for lam in lambdas:
                 score_df["total_score"] = score_df["rev_score"] + float(lam) * score_df["fwd_score"]
@@ -675,16 +707,30 @@ def main() -> None:
                     for r in chosen_rows.to_dict(orient="records")
                 }
                 preds = [chosen_map.get(s, ("", float("nan"), float("nan"), float("nan"), ""))[0] for s in ids_order]
-                m = compute_metrics(preds, gold_list)
                 key = f"lambda={lam:g}"
-                grid_metrics[key] = {"bleu": m["bleu"], "chrf": m["chrf"], "gm": m["score"]}
-                print(f"[noisy_channel lam={lam:g}] bleu={m['bleu']:.4f} chrf={m['chrf']:.4f} gm={m['score']:.4f}")
+                m: Optional[Dict[str, float]] = None
+                if metrics_enabled:
+                    m, computed_skip_reason = maybe_compute_metrics(preds, gold_list)
+                    if m is None:
+                        metrics_enabled = False
+                        metrics_skip_reason = computed_skip_reason
 
-                if best is None or float(m["score"]) > float(best):
-                    best = float(m["score"])
-                    best_lambda = float(lam)
-                    best_preds = preds
-                    best_rows = chosen_rows.copy()
+                if m is None:
+                    grid_metrics[key] = {"bleu": None, "chrf": None, "gm": None}
+                    print(f"[noisy_channel lam={lam:g}] metrics skipped ({metrics_skip_reason})")
+                    if best_rows is None:
+                        best_lambda = float(lam)
+                        best_preds = preds
+                        best_rows = chosen_rows.copy()
+                else:
+                    grid_metrics[key] = {"bleu": m["bleu"], "chrf": m["chrf"], "gm": m["score"]}
+                    print(f"[noisy_channel lam={lam:g}] bleu={m['bleu']:.4f} chrf={m['chrf']:.4f} gm={m['score']:.4f}")
+
+                    if best is None or float(m["score"]) > float(best):
+                        best = float(m["score"])
+                        best_lambda = float(lam)
+                        best_preds = preds
+                        best_rows = chosen_rows.copy()
 
             metrics_out["noisy"] = {
                 "lambda_grid": lambdas,
@@ -694,6 +740,8 @@ def main() -> None:
                 "fwd_score_col": fwd_col or "",
                 "max_cands_per_id": int(args.max_cands_per_id) if args.max_cands_per_id else None,
                 "prune_strategy": str(args.prune_strategy),
+                "metrics_skipped": metrics_skip_reason is not None,
+                "metrics_skip_reason": metrics_skip_reason,
             }
 
             # Save best predictions

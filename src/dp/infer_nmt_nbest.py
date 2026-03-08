@@ -57,6 +57,7 @@ from typing import Any, Iterable, List, Optional
 import pandas as pd
 
 from .align_train import normalize_transliteration
+from .gloss_infer import add_gloss_args, maybe_apply_gloss
 from .utils import clean_text, get_data_dir, load_config, set_seed
 
 
@@ -153,6 +154,7 @@ def main() -> None:
     )
 
     parser.add_argument("--max-rows", type=int, default=None, help="Use first N rows.")
+    add_gloss_args(parser)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -175,11 +177,11 @@ def main() -> None:
         df = df.head(args.max_rows).reset_index(drop=True)
 
     ids = df[id_col].astype(str).tolist() if id_col in df.columns else [str(i) for i in range(len(df))]
-    src_texts = df[src_col].fillna("").astype(str).tolist()
+    base_src_texts = df[src_col].fillna("").astype(str).tolist()
     if norm_variant:
-        src_texts = [normalize_transliteration(text, norm_variant) for text in src_texts]
+        base_src_texts = [normalize_transliteration(text, norm_variant) for text in base_src_texts]
     else:
-        src_texts = [clean_text(text) for text in src_texts]
+        base_src_texts = [clean_text(text) for text in base_src_texts]
 
     # --- load model(s) ---
     ckpt_dirs: list[Path] = []
@@ -269,7 +271,7 @@ def main() -> None:
 
     print("=== infer_nmt_nbest settings ===")
     print(
-        f"rows={len(src_texts)} batch={batch_size} k={k} runs={runs} do_sample={do_sample} "
+        f"rows={len(base_src_texts)} batch={batch_size} k={k} runs={runs} do_sample={do_sample} "
         f"src_len={max_source_length} gen_limit={gen_limit} use_max_new_tokens={use_max_new_tokens} "
         f"beams={num_beams} len_penalty={length_penalty} early_stopping={early_stopping} "
         f"no_repeat_ngram={no_repeat_ngram_size} rep_penalty={repetition_penalty} "
@@ -283,6 +285,15 @@ def main() -> None:
         tag = str(args.tag)
         full_tag = f"{tag}|{model_name}" if len(ckpt_dirs) > 1 else tag
         print(f"[load] model={ckpt_dir} tag={full_tag}")
+
+        # 任意: 辞書グロスをソース末尾に付与（学習で使っているなら推論でも一致させる）
+        src_texts = maybe_apply_gloss(
+            base_src_texts,
+            args=args,
+            cfg=cfg,
+            data_dir=data_dir,
+            ckpt_dir=ckpt_dir,
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir))
         model = AutoModelForSeq2SeqLM.from_pretrained(str(ckpt_dir))

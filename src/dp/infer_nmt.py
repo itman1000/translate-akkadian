@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import pandas as pd
 
 from .align_train import normalize_transliteration
+from .gloss_infer import add_gloss_args, maybe_apply_gloss
 from .utils import clean_text, get_data_dir, load_config
 from .nmt_ensemble import EnsembleGenConfig, ensemble_generate
 
@@ -112,6 +113,7 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty.")
     parser.add_argument("--num-beams", type=int, default=None, help="Beam size.")
     parser.add_argument("--max-rows", type=int, default=None, help="Use first N rows.")
+    add_gloss_args(parser)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -166,6 +168,9 @@ def main() -> None:
     missing = [p for p in ckpt_dirs if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Model dir not found: {missing[0]}")
+
+    # 任意: 辞書グロスをソース末尾に付与（学習で使っているなら推論でも一致させる）
+    src_texts = maybe_apply_gloss(src_texts, args=args, cfg=cfg, data_dir=data_dir, ckpt_dir=ckpt_dirs[0])
 
     tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dirs[0]))
 

@@ -539,6 +539,11 @@ python -m dp.train_nmt --config configs/nmt_byt5_small.yaml \
 有効化する場合は **学習と推論の両方で同じ設定を使ってください**
 （片方だけだと分布がズレて精度が落ちやすいです）。
 
+推論側は、ckpt 内の `train_meta.json` に `gloss.enabled=true` が入っている場合、
+`dp.infer_nmt` / `dp.infer_nmt_nbest` が **gloss を自動有効化**します（無効化したい場合は `--no-gloss`）。
+また、`train_meta.json` の辞書パスが Colab 由来の絶対パス（例: `/content/...`）で存在しない場合は、
+`data_dir`（無ければ `repo/data`）の同名ファイルへ自動フォールバックします。
+
 #### 推奨の安定化設定（ノイズ/長さ対策）
 
 グロスを付与すると入力が長くなり、また機能語（ana/ina/ša/u など）がヒントを埋めてしまうことがあります。
@@ -659,6 +664,8 @@ python -m dp.eval_rerank_methods \
 - `--max-cands-per-id` は noisy-channel の reverse 採点対象だけを間引きます。
   **MBR は候補全体で計算**されるため、MBR のスコア自体はここでは低下しません。
   （最終的に「全部の候補で noisy を回す」場合は、`--max-cands-per-id` を外してください）
+- `gold` が空の test 用 rerank や、Kaggle のオフライン提出環境で `sacrebleu` が無い場合は、**BLEU/chrF++/gm をスキップしても `pred_noisy_channel.csv` は保存**されます。
+  この用途では `--lambda-fwd 0.5` のように **λ を固定**して使ってください（`--lambda-fwd-grid` の比較には gold が必要です）。
 ```
 
 出力:
@@ -1008,7 +1015,7 @@ python -m dp.validate --submission submission.csv --data-dir /kaggle/input/<data
 Kaggle Code 形式の提出は `submit_kaggle.ipynb` を使うのが簡単です。詳細は `README_KAGGLE.md` を参照してください。
 リポジトリDatasetのzipにより1階層深いパスになる場合は、Notebook先頭で `REPO_DIR` を明示指定してください。
 `submit_kaggle.ipynb` では `PYTHONPATH=src` を自動設定して `python -m dp.*` が動くようにしています。
-依存チェックは `sacrebleu` のみ追加インストールします（`requirements.txt` 全体は入れず、Kaggle 標準の依存を前提）。
+提出（Internet=OFF）を想定し、`submit_kaggle.ipynb` の依存チェックでは `sacrebleu` を**任意依存**として扱います（未導入なら BLEU/chrF++ などの評価ログをスキップ）。
 Notebook内の `overrides` 辞書には `configs/nmt_byt5_small.yaml` の全キーを列挙してあります。`None` は元設定を維持し、上書きがある場合のみ `configs/nmt_byt5_small.runtime.json` を生成してそれを使います。
 `submit_kaggle.ipynb` の `RUN_TRAIN` を `False` にすると学習をスキップし、`INFER_CKPT_DIR`（または `MODEL_DIR`）のモデルで推論だけ行います。
 提出用の `submission.csv` は `/kaggle/working/submission.csv` に出力されます。
