@@ -1,9 +1,10 @@
-"""publications.csv の行頭行番号を除去し、曖昧行を落とす。"""
+"""publications.csv を OCR 用に安全に前処理する。"""
 
 from __future__ import annotations
 
 import argparse
 import re
+import zipfile
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -23,6 +24,9 @@ _SPLIT_RE = re.compile(r"[;/,]")
 _STRIP_CHARS = ".,;:!?\"'()[]{}<>"
 _MULTI_SPACE_RE = re.compile(r"\s+")
 _DROP_LSTRIP = " -–—•*"
+_PURE_PAGE_NUM_RE = re.compile(r"^\s*\d{1,4}\s*$")
+_SOFT_HYPHEN_RE = re.compile("\u00ad")
+
 _STRICT_WHITELIST_PATTERNS = [
     re.compile(r"\{[^}]+\}"),
     re.compile(r"\(d\)", re.IGNORECASE),
@@ -43,8 +47,21 @@ _STRICT_WHITELIST_PATTERNS = [
 ]
 
 
+def _decode_newlines(text: str) -> str:
+    if not text:
+        return ""
+    out = str(text).replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    out = out.replace("\r\n", "\n").replace("\r", "\n")
+    out = _SOFT_HYPHEN_RE.sub("", out)
+    out = out.translate(_DASH_MAP)
+    out = _APOSTROPHE_RE.sub("'", out)
+    out = re.sub(r"(?<=\w)-\n(?=\w)", "", out)
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
 def _is_strict_akkadian_line(text: str) -> bool:
-    """超厳格ホワイトリストに合致するか判定する。"""
     for pattern in _STRICT_WHITELIST_PATTERNS:
         if pattern.search(text):
             return True
@@ -52,7 +69,6 @@ def _is_strict_akkadian_line(text: str) -> bool:
 
 
 def load_noise_patterns(path: Path) -> Tuple[List[re.Pattern[str]], List[re.Pattern[str]]]:
-    """ノイズ除去用のパターンを読み込む。"""
     drop_line: List[re.Pattern[str]] = []
     remove_inline: List[re.Pattern[str]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -75,7 +91,6 @@ def load_noise_patterns(path: Path) -> Tuple[List[re.Pattern[str]], List[re.Patt
 
 
 def load_unit_tokens(path: Path) -> set[str]:
-    """単位リストを読み込み、照合用のトークン集合を作る。"""
     tokens: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         text = line.strip()
@@ -143,34 +158,76 @@ def _apply_noise_filters(
     candidate: str,
     drop_line_patterns: List[re.Pattern[str]],
     inline_patterns: List[re.Pattern[str]],
-    strict_whitelist: bool,
     stats: Counter[str],
+    *,
+    strict_whitelist: bool = False,
+    stat_prefix: str = "",
 ) -> str | None:
-    """ノイズパターンの除去を適用して、空になれば None を返す。"""
     if not candidate:
-        stats["lines_dropped_empty"] += 1
+        stats[f"{stat_prefix}lines_dropped_empty"] += 1
         return None
     match_target = candidate.lstrip(_DROP_LSTRIP)
+    if _PURE_PAGE_NUM_RE.match(match_target):
+        stats[f"{stat_prefix}page_number_dropped"] += 1
+        return None
     if drop_line_patterns and any(p.search(match_target) for p in drop_line_patterns):
-        stats["line_noise_dropped"] += 1
+        stats[f"{stat_prefix}line_noise_dropped"] += 1
         return None
     removed = 0
     for pattern in inline_patterns:
         candidate, count = pattern.subn("", candidate)
         removed += count
     if removed:
-        stats["inline_noise_removed"] += removed
+        stats[f"{stat_prefix}inline_noise_removed"] += removed
         candidate = _MULTI_SPACE_RE.sub(" ", candidate).strip()
     if not candidate:
-        stats["lines_dropped_empty"] += 1
+        stats[f"{stat_prefix}lines_dropped_empty"] += 1
         return None
     if strict_whitelist and not _is_strict_akkadian_line(candidate):
-        stats["strict_whitelist_drop"] += 1
+        stats[f"{stat_prefix}strict_whitelist_drop"] += 1
         return None
     return candidate
 
 
-def clean_page_text(
+def clean_translation_page_text(
+    text: str,
+    drop_line_patterns: List[re.Pattern[str]],
+    inline_patterns: List[re.Pattern[str]],
+) -> Tuple[str, Counter[str]]:
+    """翻訳段落を壊さない穏当なページクリーニング。"""
+    stats: Counter[str] = Counter()
+    if not text:
+        return "", stats
+
+    normalized = _decode_newlines(text)
+    output_lines: List[str] = []
+    prev_blank = False
+    for raw in normalized.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            if output_lines and not prev_blank:
+                output_lines.append("")
+            prev_blank = True
+            continue
+        prev_blank = False
+        stats["translation_lines_total"] += 1
+        candidate = _apply_noise_filters(
+            stripped,
+            drop_line_patterns,
+            inline_patterns,
+            stats,
+            strict_whitelist=False,
+            stat_prefix="translation_",
+        )
+        if candidate is None:
+            continue
+        output_lines.append(candidate)
+    while output_lines and output_lines[-1] == "":
+        output_lines.pop()
+    return "\n".join(output_lines), stats
+
+
+def clean_translit_page_text(
     text: str,
     unit_tokens: set[str],
     drop_ambiguous: bool,
@@ -178,24 +235,18 @@ def clean_page_text(
     inline_patterns: List[re.Pattern[str]],
     strict_whitelist: bool,
 ) -> Tuple[str, Counter[str]]:
-    """行頭の行番号を除去し、判別不能な行を捨てる。"""
+    """行頭行番号を外しつつ、転写らしい行だけを残す。"""
     stats: Counter[str] = Counter()
     if not text:
         return "", stats
 
-    # CSV 内で "\\n" として保存された改行を実改行に戻す
-    if "\\n" in text or "\\r" in text:
-        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
-
-    lines = text.splitlines()
+    lines = _decode_newlines(text).splitlines()
     cleaned_lines: List[str] = []
     for line in lines:
         raw_line = line.strip()
         if not raw_line:
             continue
         stats["lines_total"] += 1
-
-        # アポストロフィを統一して判定しやすくする
         raw_line = _APOSTROPHE_RE.sub("'", raw_line)
 
         if _DECIMAL_START_RE.match(raw_line):
@@ -203,8 +254,8 @@ def clean_page_text(
                 raw_line,
                 drop_line_patterns,
                 inline_patterns,
-                strict_whitelist,
                 stats,
+                strict_whitelist=strict_whitelist,
             )
             if candidate is None:
                 continue
@@ -218,8 +269,8 @@ def clean_page_text(
                 raw_line,
                 drop_line_patterns,
                 inline_patterns,
-                strict_whitelist,
                 stats,
+                strict_whitelist=strict_whitelist,
             )
             if candidate is None:
                 continue
@@ -232,19 +283,16 @@ def clean_page_text(
         if prime:
             stats["line_start_prime"] += 1
             stats["line_number_removed"] += 1
-            if rest:
-                candidate = _apply_noise_filters(
-                    rest,
-                    drop_line_patterns,
-                    inline_patterns,
-                    strict_whitelist,
-                    stats,
-                )
-                if candidate is None:
-                    continue
-                cleaned_lines.append(candidate)
-            else:
-                stats["lines_dropped_empty"] += 1
+            candidate = _apply_noise_filters(
+                rest,
+                drop_line_patterns,
+                inline_patterns,
+                stats,
+                strict_whitelist=strict_whitelist,
+            )
+            if candidate is None:
+                continue
+            cleaned_lines.append(candidate)
             continue
 
         if rest:
@@ -255,8 +303,8 @@ def clean_page_text(
                     raw_line,
                     drop_line_patterns,
                     inline_patterns,
-                    strict_whitelist,
                     stats,
+                    strict_whitelist=strict_whitelist,
                 )
                 if candidate is None:
                     continue
@@ -269,78 +317,47 @@ def clean_page_text(
             continue
 
         stats["line_number_removed"] += 1
-        if rest:
-            candidate = _apply_noise_filters(
-                rest,
-                drop_line_patterns,
-                inline_patterns,
-                strict_whitelist,
-                stats,
-            )
-            if candidate is None:
-                continue
-            cleaned_lines.append(candidate)
-        else:
-            stats["lines_dropped_empty"] += 1
+        candidate = _apply_noise_filters(
+            rest,
+            drop_line_patterns,
+            inline_patterns,
+            stats,
+            strict_whitelist=strict_whitelist,
+        )
+        if candidate is None:
+            continue
+        cleaned_lines.append(candidate)
 
     return "\n".join(cleaned_lines), stats
 
 
 def _iter_chunks(path: Path, usecols: List[str], chunksize: int) -> Iterable[pd.DataFrame]:
-    return pd.read_csv(path, usecols=usecols, chunksize=chunksize, engine="python")
+    if path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            members = [name for name in zf.namelist() if name.lower().endswith(".csv") and not name.startswith("__MACOSX/")]
+            if not members:
+                raise FileNotFoundError(f"No CSV found in ZIP: {path}")
+            with zf.open(members[0]) as handle:
+                yield from pd.read_csv(handle, usecols=usecols, chunksize=chunksize, engine="python")
+        return
+    yield from pd.read_csv(path, usecols=usecols, chunksize=chunksize, engine="python")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Clean publications.csv line numbers.")
+    parser = argparse.ArgumentParser(description="Clean publications.csv for OCR extraction.")
     parser.add_argument("--config", required=True, help="Config file path.")
     parser.add_argument("--input", default=None, help="Input publications.csv path.")
     parser.add_argument("--out", default=None, help="Output path (csv or parquet prefix).")
     parser.add_argument("--format", default="csv", choices=["csv", "parquet"], help="Output format.")
-    parser.add_argument(
-        "--unit-list",
-        default="docs/akkadian_after_number_tokens.txt",
-        help="Unit list file path.",
-    )
-    parser.add_argument(
-        "--noise-list",
-        default="docs/publications_noise_patterns.txt",
-        help="ノイズ除去パターンの一覧ファイル。",
-    )
-    parser.add_argument(
-        "--drop-ambiguous",
-        action="store_true",
-        help="単位判定できない行頭数字行は削除する。",
-    )
-    parser.add_argument(
-        "--keep-ambiguous",
-        action="store_true",
-        help="単位判定できない行頭数字行も残す。",
-    )
-    parser.add_argument(
-        "--drop-empty",
-        action="store_true",
-        help="クリーニング後に空になった行を除去する。",
-    )
-    parser.add_argument(
-        "--strict-whitelist",
-        action="store_true",
-        help="超厳格ホワイトリストに合致しない行は削除する（デフォルトは有効）。",
-    )
-    parser.add_argument(
-        "--no-strict-whitelist",
-        action="store_true",
-        help="超厳格ホワイトリストの削除を無効化する。",
-    )
-    parser.add_argument(
-        "--filter-akkadian",
-        action="store_true",
-        help="has_akkadian == True の行だけを残す（デフォルトは有効）。",
-    )
-    parser.add_argument(
-        "--no-filter-akkadian",
-        action="store_true",
-        help="has_akkadian フィルタを無効化する。",
-    )
+    parser.add_argument("--unit-list", default="docs/akkadian_after_number_tokens.txt", help="Unit list file path.")
+    parser.add_argument("--noise-list", default="docs/publications_noise_patterns.txt", help="Noise pattern file.")
+    parser.add_argument("--drop-ambiguous", action="store_true", help="Drop ambiguous line-start numbers.")
+    parser.add_argument("--keep-ambiguous", action="store_true", help="Keep ambiguous line-start numbers.")
+    parser.add_argument("--drop-empty", action="store_true", help="Drop rows whose cleaned page text is empty.")
+    parser.add_argument("--strict-whitelist", action="store_true", help="Enable strict transliteration whitelist.")
+    parser.add_argument("--no-strict-whitelist", action="store_true", help="Disable strict transliteration whitelist.")
+    parser.add_argument("--filter-akkadian", action="store_true", help="Keep only has_akkadian == True rows.")
+    parser.add_argument("--no-filter-akkadian", action="store_true", help="Disable has_akkadian filter.")
     parser.add_argument("--max-rows", type=int, default=None, help="Use first N rows for quick runs.")
     parser.add_argument("--chunksize", type=int, default=2000, help="Chunk size.")
     args = parser.parse_args()
@@ -357,11 +374,7 @@ def main() -> None:
     noise_list_path = Path(args.noise_list)
     drop_line_patterns, inline_patterns = load_noise_patterns(noise_list_path)
 
-    # keep_ambiguous が明示されている場合はそちらを優先する
-    if args.keep_ambiguous:
-        drop_ambiguous = False
-    else:
-        drop_ambiguous = True
+    drop_ambiguous = False if args.keep_ambiguous else True
     drop_empty = bool(args.drop_empty)
     if args.no_filter_akkadian:
         filter_akkadian = False
@@ -401,10 +414,12 @@ def main() -> None:
         if filter_akkadian and "has_akkadian" in chunk.columns:
             chunk = chunk[chunk["has_akkadian"] == True].reset_index(drop=True)  # noqa: E712
 
-        cleaned_texts: List[str] = []
+        clean_rows: List[str] = []
+        translit_rows: List[str] = []
         stats_rows: List[Counter[str]] = []
         for text in chunk["page_text"].fillna("").astype(str):
-            cleaned, stats = clean_page_text(
+            clean_text, clean_stats = clean_translation_page_text(text, drop_line_patterns, inline_patterns)
+            translit_text, translit_stats = clean_translit_page_text(
                 text,
                 unit_tokens,
                 drop_ambiguous,
@@ -412,14 +427,22 @@ def main() -> None:
                 inline_patterns,
                 strict_whitelist,
             )
-            cleaned_texts.append(cleaned)
-            stats_rows.append(stats)
-            totals.update(stats)
+            merged_stats = clean_stats + translit_stats
+            clean_rows.append(clean_text)
+            translit_rows.append(translit_text)
+            stats_rows.append(merged_stats)
+            totals.update(merged_stats)
 
         chunk_out = chunk.copy()
-        chunk_out["page_text_clean"] = cleaned_texts
+        chunk_out["page_text_clean"] = clean_rows
+        chunk_out["page_text_translit"] = translit_rows
 
         stat_keys = [
+            "translation_lines_total",
+            "translation_line_noise_dropped",
+            "translation_inline_noise_removed",
+            "translation_lines_dropped_empty",
+            "translation_page_number_dropped",
             "lines_total",
             "line_start_total",
             "line_start_prime",
@@ -432,6 +455,7 @@ def main() -> None:
             "line_noise_dropped",
             "inline_noise_removed",
             "lines_dropped_empty",
+            "page_number_dropped",
         ]
         for key in stat_keys:
             chunk_out[key] = [row.get(key, 0) for row in stats_rows]
@@ -447,21 +471,17 @@ def main() -> None:
             chunk_out.to_csv(out_path, mode="w" if first_csv else "a", header=first_csv, index=False)
             first_csv = False
         else:
+            assert out_dir is not None
             part_path = out_dir / f"{prefix}-part-{part_idx:04d}.parquet"
             chunk_out.to_parquet(part_path, index=False)
             part_idx += 1
 
-    print(f"Input rows: {total_rows}")
-    print(f"Output rows: {kept_rows}")
-    print(
-        "drop_ambiguous={} drop_empty={} filter_akkadian={} strict_whitelist={}".format(
-            drop_ambiguous,
-            drop_empty,
-            filter_akkadian,
-            strict_whitelist,
-        )
-    )
     summary_keys = [
+        "translation_lines_total",
+        "translation_line_noise_dropped",
+        "translation_inline_noise_removed",
+        "translation_lines_dropped_empty",
+        "translation_page_number_dropped",
         "lines_total",
         "line_start_total",
         "line_start_prime",
@@ -474,17 +494,21 @@ def main() -> None:
         "line_noise_dropped",
         "inline_noise_removed",
         "lines_dropped_empty",
+        "page_number_dropped",
     ]
     summary = {key: totals.get(key, 0) for key in summary_keys}
+
+    print(f"Input rows: {total_rows}")
+    print(f"Output rows: {kept_rows}")
     print(
-        "lines_total={lines_total} line_start_total={line_start_total} "
-        "line_start_prime={line_start_prime} line_number_removed={line_number_removed} "
-        "line_start_quantity_keep={line_start_quantity_keep} line_start_decimal_keep={line_start_decimal_keep} "
-        "line_start_ambiguous={line_start_ambiguous} line_start_ambiguous_dropped={line_start_ambiguous_dropped} "
-        "strict_whitelist_drop={strict_whitelist_drop} line_noise_dropped={line_noise_dropped} "
-        "inline_noise_removed={inline_noise_removed} "
-        "lines_dropped_empty={lines_dropped_empty}".format(**summary)
+        "drop_ambiguous={} drop_empty={} filter_akkadian={} strict_whitelist={}".format(
+            drop_ambiguous,
+            drop_empty,
+            filter_akkadian,
+            strict_whitelist,
+        )
     )
+    print("Summary:", summary)
     if args.format == "csv":
         print(f"Saved cleaned CSV: {out_path}")
     else:

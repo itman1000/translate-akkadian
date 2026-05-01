@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
@@ -65,6 +67,188 @@ _STOPWORDS = {
     "her",
     "he",
     "she",
+}
+
+_LANG_STOPWORDS: Dict[str, set[str]] = {
+    "en": {
+        "the",
+        "and",
+        "of",
+        "to",
+        "in",
+        "that",
+        "is",
+        "was",
+        "were",
+        "for",
+        "with",
+        "as",
+        "on",
+        "by",
+        "from",
+        "at",
+        "into",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "be",
+        "are",
+        "an",
+        "a",
+        "or",
+        "which",
+        "who",
+        "their",
+        "has",
+        "have",
+        "had",
+        "not",
+        "but",
+        "also",
+        "we",
+        "our",
+        "they",
+        "them",
+        "his",
+        "her",
+        "he",
+        "she",
+        "you",
+        "your",
+        "if",
+        "when",
+        "then",
+    },
+    "fr": {
+        "le",
+        "la",
+        "les",
+        "de",
+        "des",
+        "du",
+        "et",
+        "en",
+        "dans",
+        "pour",
+        "sur",
+        "par",
+        "avec",
+        "que",
+        "qui",
+        "une",
+        "un",
+        "au",
+        "aux",
+        "ce",
+        "ces",
+        "cette",
+        "son",
+        "sa",
+        "ses",
+        "leur",
+        "leurs",
+        "est",
+        "sont",
+        "ont",
+        "pas",
+        "ne",
+        "il",
+        "elle",
+        "nous",
+        "vous",
+        "ils",
+        "elles",
+    },
+    "de": {
+        "der",
+        "die",
+        "das",
+        "den",
+        "dem",
+        "des",
+        "und",
+        "zu",
+        "in",
+        "mit",
+        "auf",
+        "von",
+        "für",
+        "fur",
+        "ein",
+        "eine",
+        "einer",
+        "einem",
+        "einen",
+        "ist",
+        "sind",
+        "war",
+        "waren",
+        "nicht",
+        "auch",
+        "als",
+        "dass",
+        "daß",
+        "wie",
+        "sie",
+        "er",
+        "wir",
+        "ihr",
+        "ihre",
+        "ihren",
+        "seine",
+        "seiner",
+    },
+    "tr": {
+        "ve",
+        "bir",
+        "bu",
+        "ile",
+        "için",
+        "icin",
+        "olarak",
+        "olan",
+        "da",
+        "de",
+        "ki",
+        "mi",
+        "mı",
+        "mu",
+        "mü",
+        "veya",
+        "ama",
+        "fakat",
+        "gibi",
+        "olan",
+        "oldu",
+        "vardır",
+        "vardir",
+        "yok",
+        "bu",
+        "şu",
+        "su",
+        "o",
+        "birçok",
+        "bircok",
+        "daha",
+        "sonra",
+        "önce",
+        "once",
+        "onun",
+        "onlar",
+        "biz",
+        "siz",
+    },
+}
+
+_LANG_DISPLAY = {
+    "en": "English",
+    "fr": "French",
+    "de": "German",
+    "tr": "Turkish",
+    "other": "Other Latin-script language",
+    "unknown": "Unknown",
 }
 
 _ANCHOR_MAP = str.maketrans(
@@ -134,6 +318,17 @@ class TranslitThresholds:
     max_stopword_hits: int
 
 
+@dataclass(frozen=True)
+class TranslationThresholds:
+    min_chars: int
+    min_words: int
+    min_alpha_ratio: float
+    max_symbol_ratio: float
+    max_digit_ratio: float
+    min_best_stopword_hits: int
+    max_upper_ratio: float
+
+
 def normalize_newlines(text: str) -> str:
     if not text:
         return ""
@@ -201,6 +396,15 @@ def count_stopwords(text: str) -> int:
     return hits
 
 
+def count_stopwords_by_lang(text: str) -> Dict[str, int]:
+    hits: Dict[str, int] = {lang: 0 for lang in _LANG_STOPWORDS}
+    for token in _WORD_RE.findall(text.lower()):
+        for lang, stopset in _LANG_STOPWORDS.items():
+            if token in stopset:
+                hits[lang] += 1
+    return hits
+
+
 def _translit_marker_token(token: str) -> bool:
     if any(ch.isdigit() for ch in token):
         return True
@@ -230,6 +434,79 @@ def english_score(stats: Dict[str, float | int], stopword_hits: int) -> float:
 
 def translit_score(marker_ratio: float, upper_ratio: float) -> float:
     return min(marker_ratio, 1.0) * 0.6 + min(upper_ratio, 1.0) * 0.4
+
+
+def detect_translation_language(text: str) -> Tuple[str, Dict[str, float | int | str]]:
+    stats = text_stats(text)
+    lang_hits = count_stopwords_by_lang(text)
+    ranked = sorted(lang_hits.items(), key=lambda item: (-item[1], item[0]))
+    best_lang = ranked[0][0] if ranked else "unknown"
+    best_hits = ranked[0][1] if ranked else 0
+    second_hits = ranked[1][1] if len(ranked) >= 2 else 0
+    tokens = max(int(stats.get("tokens", 0)), 1)
+    confidence = max(best_hits - second_hits, 0) / tokens
+
+    if best_hits <= 0:
+        if float(stats.get("alpha_ratio", 0.0)) >= 0.72 and float(stats.get("upper_ratio", 0.0)) <= 0.28:
+            best_lang = "other"
+        else:
+            best_lang = "unknown"
+
+    metrics: Dict[str, float | int | str] = {
+        "lang": best_lang,
+        "lang_name": _LANG_DISPLAY.get(best_lang, "Unknown"),
+        "best_stopword_hits": best_hits,
+        "second_stopword_hits": second_hits,
+        "lang_confidence": round(confidence, 6),
+        **{f"stopwords_{lang}": count for lang, count in lang_hits.items()},
+        **stats,
+    }
+    return best_lang, metrics
+
+
+def translation_like_score(
+    stats: Dict[str, float | int],
+    best_stopword_hits: int,
+    lang_confidence: float,
+) -> float:
+    alpha = float(stats.get("alpha_ratio", 0.0))
+    stop = min(best_stopword_hits, 3) / 3
+    conf = min(max(lang_confidence, 0.0), 1.0)
+    return alpha * 0.55 + stop * 0.30 + conf * 0.15
+
+
+def is_translation_like(
+    text: str,
+    thresholds: TranslationThresholds,
+) -> Tuple[bool, Dict[str, float | int | str]]:
+    lang, lang_metrics = detect_translation_language(text)
+    stats = text_stats(text)
+    best_stopword_hits = int(lang_metrics.get("best_stopword_hits", 0))
+    lang_confidence = float(lang_metrics.get("lang_confidence", 0.0))
+    score = translation_like_score(stats, best_stopword_hits, lang_confidence)
+    metrics: Dict[str, float | int | str] = {
+        "score": score,
+        **lang_metrics,
+    }
+
+    if int(stats["len"]) < thresholds.min_chars:
+        return False, metrics
+    if int(stats["tokens"]) < thresholds.min_words:
+        return False, metrics
+    if float(stats["alpha_ratio"]) < thresholds.min_alpha_ratio:
+        return False, metrics
+    if float(stats["symbol_ratio"]) > thresholds.max_symbol_ratio:
+        return False, metrics
+    if float(stats["digit_ratio"]) > thresholds.max_digit_ratio:
+        return False, metrics
+    if float(stats["upper_ratio"]) > thresholds.max_upper_ratio:
+        return False, metrics
+    if best_stopword_hits >= thresholds.min_best_stopword_hits:
+        return True, metrics
+
+    if lang == "other" and float(stats["alpha_ratio"]) >= max(0.75, thresholds.min_alpha_ratio + 0.08):
+        return True, metrics
+    return False, metrics
 
 
 def is_english_like(text: str, thresholds: EnglishThresholds) -> Tuple[bool, Dict[str, float | int]]:
@@ -332,3 +609,85 @@ def count_sentence_endings(text: str) -> int:
         return 0
     protected = _protect_sentence_dots(text)
     return len(re.findall(r'[.!?](?=(?:["\')\]]+)?\s|$)', protected))
+
+
+
+def normalize_lookup_text(text: str) -> str:
+    """識別子照合用にテキストを強めに正規化する。"""
+    if not text:
+        return ""
+    out = unicodedata.normalize("NFKD", str(text))
+    out = "".join(ch for ch in out if not unicodedata.combining(ch))
+    out = out.translate(_ANCHOR_MAP)
+    out = out.upper()
+    out = out.replace("&", " AND ")
+    out = re.sub(r"\bCUNEIFORM\s+TABLET\b", " ", out)
+    out = re.sub(r"[^A-Z0-9]+", " ", out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def lookup_tokens(text: str) -> List[str]:
+    """識別子照合用トークン列を返す。"""
+    normalized = normalize_lookup_text(text)
+    if not normalized:
+        return []
+    return normalized.split()
+
+
+def split_metadata_field(text: str) -> List[str]:
+    """aliases / publication_catalog などを個別の候補に分解する。"""
+    if not text:
+        return []
+    parts: List[str] = []
+    for raw in re.split(r"[|;+\n]", str(text)):
+        part = raw.strip()
+        if not part:
+            continue
+        parts.append(part)
+    return parts
+
+
+def dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def token_jaccard(a: Iterable[str], b: Iterable[str]) -> float:
+    a_set = {tok for tok in a if tok}
+    b_set = {tok for tok in b if tok}
+    if not a_set or not b_set:
+        return 0.0
+    inter = a_set.intersection(b_set)
+    union = a_set.union(b_set)
+    return len(inter) / max(len(union), 1)
+
+
+def parse_pipe_list(text: str | None) -> List[str]:
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split("|") if part.strip()]
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def stable_block_hash(text: str) -> str:
+    normalized = normalize_newlines(text)
+    normalized = _MULTI_SPACE_RE.sub(" ", normalized).strip()
+    normalized = unicodedata.normalize("NFKC", normalized)
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()

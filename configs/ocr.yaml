@@ -1,14 +1,27 @@
 # OCR 追加並列抽出の設定
+# 推奨: clean_publications -> ocr_candidates -> ocr_pairs -> mix_ocr
+
 data_dir: data
 artifacts_dir: artifacts
 
 # 候補抽出
 ocr_candidates_out: artifacts/ocr/publications_candidates.parquet
 ocr_candidates_chunksize: 2000
+ocr_candidates_min_translation_paragraphs: 1
 ocr_candidates_min_english_paragraphs: 1
 ocr_candidates_min_translit_paragraphs: 1
-ocr_text_col: page_text
+ocr_candidates_allow_single_side_metadata: true
+ocr_candidates_metadata_min_score: 0.95
+ocr_candidates_metadata_only_min_score: 1.25
+ocr_candidates_metadata_only_min_gap: 0.10
+ocr_text_col: page_text_clean
+ocr_translation_text_col: page_text_clean
+ocr_translit_text_col: page_text_translit
 ocr_has_akkadian_col: has_akkadian
+
+# metadata-first 照合
+ocr_metadata_fields: aliases,publication_catalog,inventory_position,label,cdli_id,note
+ocr_metadata_top_k: 8
 
 # 英語らしさ判定
 ocr_english_min_chars: 40
@@ -18,6 +31,18 @@ ocr_english_max_symbol_ratio: 0.25
 ocr_english_max_digit_ratio: 0.2
 ocr_english_min_stopword_hits: 2
 ocr_english_max_upper_ratio: 0.6
+
+# 英語を含む多言語の「翻訳らしさ」判定
+ocr_translation_min_chars: 40
+ocr_translation_min_words: 5
+ocr_translation_min_alpha_ratio: 0.6
+ocr_translation_max_symbol_ratio: 0.25
+ocr_translation_max_digit_ratio: 0.2
+ocr_translation_min_best_stopword_hits: 1
+ocr_translation_max_upper_ratio: 0.6
+ocr_translation_langs: fr,de,tr,other,unknown
+ocr_translation_jobs_out: artifacts/ocr/translation_jobs.parquet
+ocr_block_translations_path: artifacts/ocr/translation_jobs_translated.parquet
 
 # 転写らしさ判定
 ocr_translit_min_chars: 30
@@ -31,11 +56,18 @@ ocr_translit_max_stopword_hits: 1
 ocr_pairs_out: artifacts/ocr_pairs
 ocr_pairs_variant: C
 ocr_pairs_pair_order: src_then_tgt
-ocr_pairs_max_gap: 1
+ocr_pairs_page_window: 1
+ocr_pairs_max_gap: 3
 ocr_pairs_min_pair_score: 0.2
-ocr_pairs_drop_flagged: true
+ocr_pairs_drop_flagged: false
 ocr_align_weight_len: 0.7
 ocr_align_weight_anchor: 0.3
+ocr_align_weight_doc: 0.2
+ocr_doc_match_min_score: 0.08
+ocr_doc_match_min_score_metadata: 0.08
+ocr_doc_match_min_score_blocks_only: 0.03
+ocr_tranche_strong_doc_min_score: 0.12
+ocr_tranche_strong_metadata_min_score: 1.0
 
 # 品質ゲート（除外条件）
 ocr_gate_min_len_ratio: 0.25
@@ -69,8 +101,13 @@ ocr_tier_med_min_stopword_hits: 1
 # 学習混合
 ocr_mix_enable: true
 ocr_mix_ratio: 0.2
-ocr_mix_quality_tiers: high
+ocr_mix_quality_tiers: high,med
+ocr_mix_tranches: T1,T2,T3
+ocr_mix_ratio_by_tranche: T1=0.08,T2=0.08,T3=0.04
 ocr_mix_variants: C
+ocr_mix_source_subtypes: ocr_en,ocr_mt_fr,ocr_mt_de,ocr_mt_tr,ocr_mt_other,ocr_mt_unknown
+ocr_mix_max_per_oare_id: 6
+ocr_mix_max_per_pdf: 20
 ocr_mix_aligned_path: artifacts/aligned/aligned_train.parquet
 ocr_mix_ocr_glob: artifacts/ocr_pairs
 ocr_mix_out: artifacts/ocr_pairs/mixed_train.parquet

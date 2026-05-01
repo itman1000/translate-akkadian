@@ -842,7 +842,14 @@ python -m dp.align_train --config configs/align.yaml   --data-dir "${COMP_DATA_D
 > - デバッグログ: `--oare-debug`（`artifacts/aligned/oare_debug.csv` を出力）
 
 #### 7-A2) OCR 追加並列（任意）
-Kaggle の `RUN_OCR=True` 相当です。`セル 5-D` で `RUN_OCR="1"` にしてから実行してください。
+Kaggle の `RUN_OCR=True` 相当です。`セル 5-D` で `RUN_OCR="1"` にしてから実行してください。  
+このフローは **metadata-first + 多言語 OCR 保持 + tranche(T1〜T5) 出力** に組み替えてあります。
+
+- `clean_publications` で **翻訳段落を壊さない** `page_text_clean` と、転写確認用の `page_text_translit` を作る
+- `ocr_candidates` が `published_texts.csv` の `aliases / publication_catalog / inventory_position / cdli_id` を使って候補ページを絞り、**英語以外の訳段落も落とさない**
+- `prepare_ocr_translation_jobs` が **英語以外の訳ブロック** を dedupe して、LLM / 公開翻訳器に渡すための job 一覧を出す
+- `ocr_pairs` が **前後 ±1 ページ** をまとめて見て、`published_texts` の転写と照合しながら文ペア化し、`T1〜T5` tranche を付与する
+- `mix_ocr` は **tranche 単位** で混合できるので、Kaggle では `T1` → `T1+T2` → `T1+T2+T3` の順で増やして試せる
 
 ```bash
 %%bash
@@ -854,23 +861,644 @@ if [ "${RUN_OCR}" != "1" ]; then
   exit 0
 fi
 
-# publications.csv から OCR 候補を抽出
-python -m dp.ocr_candidates --config configs/ocr.yaml --input "${COMP_DATA_DIR}/publications.csv"
+# 1) publications.csv を安全にクリーニング
+python -m dp.clean_publications   --config configs/ocr.yaml   --input "${COMP_DATA_DIR}/publications.csv"   --out artifacts/ocr/publications_clean.csv
 
-# （任意）行番号クリーニングを使う場合は以下に切り替え
-# python -m dp.clean_publications --config configs/ocr.yaml --input "${COMP_DATA_DIR}/publications.csv" --out artifacts/ocr/publications_clean.csv
-# python -m dp.ocr_candidates --config configs/ocr.yaml --input artifacts/ocr/publications_clean.csv --text-col page_text_clean --overwrite
+# 2) metadata-first で候補ページ抽出
+python -m dp.ocr_candidates   --config configs/ocr.yaml   --input artifacts/ocr/publications_clean.csv   --text-col page_text_clean   --published-texts "${COMP_DATA_DIR}/published_texts.csv"   --overwrite
 
-# 候補 → ペア抽出 → 高品質のみ混合
-python -m dp.ocr_pairs --config configs/ocr.yaml --overwrite
-python -m dp.mix_ocr --config configs/ocr.yaml --aligned artifacts/aligned/aligned_train.parquet
+# 3) 非英語 OCR ブロックの英語化ジョブを作る
+python -m dp.prepare_ocr_translation_jobs   --config configs/ocr.yaml   --candidates artifacts/ocr   --out artifacts/ocr/translation_jobs.parquet
+
+# 4) translation_jobs.parquet を TranslateGemma で英語化する
+#    デフォルトは TranslateGemma-4B。12B を使う場合は 4B の代わりに 12B セルを実行する。
+#    どちらも最終出力は artifacts/ocr/translation_jobs_translated.parquet に保存する。
+
+# 5) 前後ページも見ながら文ペア抽出
+python -m dp.ocr_pairs   --config configs/ocr.yaml   --published-texts "${COMP_DATA_DIR}/published_texts.csv"   --overwrite
+
+# 6) tranche 単位で OCR を混合（まずは T1+T2+T3）
+python -m dp.mix_ocr   --config configs/ocr.yaml   --aligned artifacts/aligned/aligned_train.parquet
+```
+
+
+#### 7-A2a-1) TranslateGemma を使う前の準備（1回だけ）
+- Hugging Face で `google/translategemma-4b-it` / `google/translategemma-12b-it` の利用条件に同意しておく
+- Colab Secrets に `HF_TOKEN` を登録しておくと楽です（無くても、すでに `huggingface-cli login` 済みならそのまま動きます）
+- **現在の OCR 言語推定は主に `fr,de,tr` を想定**しています。`other` / `unknown` はこのセルでは翻訳せず残します
+- **デフォルトは 4B・非量子化**です。まずはこれで動作確認してください
+- 12B は **4bit 量子化前提の任意オプション**です。G4/T4 ではまだ厳しいことがあるので、まず 4B を推奨します
+
+```python
+# Colab: TranslateGemma 実行前の準備（1回だけ）
+!pip -q install -U "transformers>=4.57.1" accelerate bitsandbytes sentencepiece safetensors huggingface_hub pyarrow
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+try:
+    from huggingface_hub import login
+    token = None
+    try:
+        from google.colab import userdata
+        token = userdata.get("HF_TOKEN")
+    except Exception:
+        token = os.environ.get("HF_TOKEN")
+    if token:
+        login(token=token, add_to_git_credential=False)
+        print("Hugging Face login: OK")
+    else:
+        print("HF_TOKEN が見つかりません。モデルDLに失敗する場合は、Colab Secrets に HF_TOKEN を追加するか huggingface-cli login を先に実行してください。")
+except Exception as e:
+    print("huggingface_hub login をスキップ:", e)
+```
+
+#### 7-A2a-2) 共通ヘルパー（4B / 12B 共通、silent failure 防止版）
+下のセルは **一度だけ** 実行してください。次の `4B` か `12B` のどちらか一方の実行セルから呼びます。
+
+> このセルは `REPO_DIR` を自動解決し、`translation_jobs.parquet` を **絶対パス** で読みます。`/content/artifacts` と `/content/repo/translate-akkadian/artifacts` のように `artifacts` が複数あっても、`REPO_DIR/artifacts/ocr` を優先します。  
+> さらに、**空出力は成功扱いしません**。`translation_en` が空なら即 `translation_error` に記録し、`translation_jobs_translated.stats.json` に集計を保存します。
+
+```python
+import gc
+import json
+import os
+import re
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import pandas as pd
+import torch
+from tqdm.auto import tqdm
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    set_seed,
+)
+
+
+def resolve_repo_dir() -> Path:
+    candidates = []
+    env_repo = os.environ.get("REPO_DIR")
+    if env_repo:
+        candidates.append(Path(env_repo))
+    candidates.extend([
+        Path("/content/repo/translate-akkadian"),
+        Path("/content/translate-akkadian"),
+        Path.cwd() / "translate-akkadian",
+        Path.cwd(),
+    ])
+    for cand in candidates:
+        cand = cand.resolve()
+        if (cand / "src").exists() and (cand / "configs").exists():
+            return cand
+    raise FileNotFoundError(
+        "translate-akkadian リポジトリが見つかりません。"
+        "セル 5 で REPO_DIR を設定するか、/content/repo/translate-akkadian に展開してください。"
+    )
+
+
+REPO_DIR = resolve_repo_dir()
+os.environ["REPO_DIR"] = str(REPO_DIR)
+os.chdir(REPO_DIR)
+if str(REPO_DIR / "src") not in sys.path:
+    sys.path.append(str(REPO_DIR / "src"))
+
+INPUT_PATH = REPO_DIR / "artifacts/ocr/translation_jobs.parquet"
+OUTPUT_PATH = REPO_DIR / "artifacts/ocr/translation_jobs_translated.parquet"
+STATS_PATH = REPO_DIR / "artifacts/ocr/translation_jobs_translated.stats.json"
+SUPPORTED_LANGS = {
+    "fr": "fr",
+    "de": "de",
+    "tr": "tr",
+}
+
+print(f"REPO_DIR={REPO_DIR}")
+print(f"INPUT_PATH={INPUT_PATH}")
+print(f"INPUT_EXISTS={INPUT_PATH.exists()}")
+print(f"OUTPUT_PATH={OUTPUT_PATH}")
+print(f"STATS_PATH={STATS_PATH}")
+
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n{2,}")
+MULTI_SPACE_RE = re.compile(r"\s+")
+EN_PREFIX_RE = re.compile(r"^\s*English\s*:\s*", re.IGNORECASE)
+
+
+def normalize_text(text: str) -> str:
+    text = str(text or "").replace("­", "")
+    text = MULTI_SPACE_RE.sub(" ", text).strip()
+    return text
+
+
+def chunk_text(text: str, max_chars: int = 900):
+    text = normalize_text(text)
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = [p.strip() for p in SENT_SPLIT_RE.split(text) if p.strip()]
+    if not parts:
+        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+    chunks = []
+    cur = ""
+    for part in parts:
+        cand = part if not cur else f"{cur} {part}"
+        if len(cand) <= max_chars:
+            cur = cand
+            continue
+        if cur:
+            chunks.append(cur)
+        if len(part) <= max_chars:
+            cur = part
+        else:
+            chunks.extend(part[i:i + max_chars] for i in range(0, len(part), max_chars))
+            cur = ""
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def build_message(text: str, src_lang: str):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "source_lang_code": src_lang,
+                    "target_lang_code": "en",
+                    "text": text,
+                }
+            ],
+        }
+    ]
+
+
+def cleanup_output_text(text: str) -> str:
+    text = str(text or "")
+    text = EN_PREFIX_RE.sub("", text).strip()
+    text = MULTI_SPACE_RE.sub(" ", text)
+    return text.strip()
+
+
+def load_jobs(input_path: Path, only_empty: bool = True, max_rows=None, sample_per_lang=None):
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"translation_jobs.parquet が見つかりません: {input_path}\n"
+            f"cwd={Path.cwd()}\n"
+            f"REPO_DIR={REPO_DIR}\n"
+            "セル 7-A2 の前半で prepare_ocr_translation_jobs を実行済みか確認してください。"
+        )
+    df = pd.read_parquet(input_path)
+    if "translation_en" not in df.columns:
+        df["translation_en"] = ""
+    df["translation_en"] = df["translation_en"].fillna("").astype(str)
+    if "translation_model" not in df.columns:
+        df["translation_model"] = ""
+    else:
+        df["translation_model"] = df["translation_model"].fillna("").astype(str)
+    if "translation_error" not in df.columns:
+        df["translation_error"] = ""
+    else:
+        df["translation_error"] = df["translation_error"].fillna("").astype(str)
+
+    if max_rows is not None:
+        df = df.head(max_rows).copy()
+    else:
+        df = df.copy()
+
+    mask = df["lang"].astype(str).isin(SUPPORTED_LANGS)
+    if only_empty:
+        mask &= df["translation_en"].str.strip().eq("")
+
+    if sample_per_lang is not None:
+        sampled = []
+        work_df = df.loc[mask].copy()
+        for lang, sub in work_df.groupby(df.loc[mask, "lang"].astype(str), sort=True):
+            sampled.append(sub.head(int(sample_per_lang)))
+        if sampled:
+            sampled_idx = pd.concat(sampled).index
+            mask &= df.index.isin(sampled_idx)
+
+    work_idx = df.index[mask].tolist()
+    skipped_idx = df.index[~mask].tolist()
+    return df, work_idx, skipped_idx
+
+
+def preferred_dtype():
+    if not torch.cuda.is_available():
+        return torch.float32
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def get_model_device(model):
+    try:
+        return model.device
+    except Exception:
+        pass
+    try:
+        return next(model.parameters()).device
+    except Exception:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def move_batch_to_device(batch, device):
+    moved = {}
+    for k, v in batch.items():
+        if hasattr(v, "to"):
+            moved[k] = v.to(device)
+        else:
+            moved[k] = v
+    return moved
+
+
+def load_translategemma(model_id: str, quantize_4bit: bool = False):
+    dtype = preferred_dtype()
+    processor = AutoProcessor.from_pretrained(model_id, use_fast=False)
+
+    common_kwargs = {
+        "device_map": "auto",
+        "low_cpu_mem_usage": True,
+    }
+
+    if not torch.cuda.is_available():
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            dtype=torch.float32,
+            **common_kwargs,
+        )
+    elif quantize_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype,
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            quantization_config=quant_config,
+            **common_kwargs,
+        )
+    else:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id,
+            dtype=dtype,
+            **common_kwargs,
+        )
+
+    model.eval()
+    return processor, model
+
+
+def batched_generate_texts(processor, model, messages_batch, max_new_tokens: int):
+    inputs = processor.apply_chat_template(
+        messages_batch,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        padding=True,
+    )
+    device = get_model_device(model)
+    inputs = move_batch_to_device(inputs, device)
+
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        raise ValueError("attention_mask が取得できませんでした")
+    input_lengths = attention_mask.sum(dim=1).tolist()
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=processor.tokenizer.eos_token_id,
+        )
+
+    texts = []
+    for i, out_ids in enumerate(outputs):
+        new_ids = out_ids[int(input_lengths[i]):]
+        text = processor.decode(new_ids, skip_special_tokens=True)
+        text = cleanup_output_text(text)
+        if not text:
+            raise ValueError("Empty translation output")
+        texts.append(text)
+    return texts
+
+
+def translate_chunks(processor, model, chunks, src_lang: str, batch_size: int, max_new_tokens: int):
+    if not chunks:
+        raise ValueError("No chunks to translate")
+    messages = [build_message(ch, src_lang) for ch in chunks]
+    outputs = []
+    for start in range(0, len(messages), batch_size):
+        batch_messages = messages[start:start + batch_size]
+        outputs.extend(
+            batched_generate_texts(
+                processor=processor,
+                model=model,
+                messages_batch=batch_messages,
+                max_new_tokens=max_new_tokens,
+            )
+        )
+    pred = " ".join([p for p in outputs if p]).strip()
+    pred = cleanup_output_text(pred)
+    if not pred:
+        raise ValueError("Empty translation output after chunk merge")
+    return pred
+
+
+def write_stats(df: pd.DataFrame, stats_path: Path, input_rows: int, translatable_rows: int, skipped_rows: int):
+    translated_mask = df["translation_en"].fillna("").astype(str).str.strip().ne("")
+    failed_mask = df["translation_error"].fillna("").astype(str).str.strip().ne("")
+
+    translated_by_lang = (
+        df.loc[translated_mask, "lang"].astype(str).value_counts(dropna=False).to_dict()
+    )
+    failed_by_lang = (
+        df.loc[failed_mask, "lang"].astype(str).value_counts(dropna=False).to_dict()
+    )
+
+    sample_per_lang = {}
+    for lang, sub in df.loc[translated_mask].groupby(df.loc[translated_mask, "lang"].astype(str)):
+        sample_per_lang[str(lang)] = sub[["text", "translation_en"]].head(3).to_dict(orient="records")
+
+    stats = {
+        "input_rows": int(input_rows),
+        "translatable_rows": int(translatable_rows),
+        "skipped_rows": int(skipped_rows),
+        "translated_nonempty": int(translated_mask.sum()),
+        "failed": int(failed_mask.sum()),
+        "translated_by_lang": translated_by_lang,
+        "failed_by_lang": failed_by_lang,
+        "sample_per_lang": sample_per_lang,
+        "output_path": str(OUTPUT_PATH),
+    }
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2))
+    print(f"Saved stats: {stats_path}")
+    return stats
+
+
+def run_translategemma_jobs(
+    model_id: str,
+    batch_size: int,
+    max_new_tokens: int = 256,
+    max_rows=None,
+    only_empty: bool = True,
+    save_every: int = 100,
+    chunk_chars: int = 900,
+    quantize_4bit: bool = False,
+    sample_per_lang=None,
+):
+    set_seed(42)
+    cuda_context_poisoned = False
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print("[WARN] 最初の empty_cache をスキップ:", e)
+
+    INPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    df, work_idx, skipped_idx = load_jobs(
+        INPUT_PATH,
+        only_empty=only_empty,
+        max_rows=max_rows,
+        sample_per_lang=sample_per_lang,
+    )
+    print(f"REPO_DIR={REPO_DIR}")
+    print(f"INPUT_PATH={INPUT_PATH.resolve()}")
+    print(f"OUTPUT_PATH={OUTPUT_PATH.resolve()}")
+    print(f"STATS_PATH={STATS_PATH.resolve()}")
+    print(f"input_rows={len(df)} translatable_rows={len(work_idx)} skipped_rows={len(skipped_idx)}")
+    if not work_idx:
+        df.to_parquet(OUTPUT_PATH, index=False)
+        write_stats(df, STATS_PATH, len(df), 0, len(skipped_idx))
+        print(f"Nothing to do. Saved as: {OUTPUT_PATH}")
+        return df
+
+    processor, model = load_translategemma(model_id, quantize_4bit=quantize_4bit)
+
+    start_time = time.time()
+    translated = 0
+    failed = 0
+
+    for i, idx in enumerate(tqdm(work_idx, desc=f"Translate with {model_id}"), start=1):
+        lang = str(df.at[idx, "lang"])
+        src_lang = SUPPORTED_LANGS.get(lang)
+        text = str(df.at[idx, "text"] or "")
+        try:
+            chunks = chunk_text(text, max_chars=chunk_chars)
+            pred = translate_chunks(
+                processor=processor,
+                model=model,
+                chunks=chunks,
+                src_lang=src_lang,
+                batch_size=batch_size,
+                max_new_tokens=max_new_tokens,
+            )
+            if not pred.strip():
+                raise ValueError("Empty translation output")
+            df.at[idx, "translation_en"] = pred
+            df.at[idx, "translation_model"] = model_id
+            df.at[idx, "translation_error"] = ""
+            translated += 1
+        except Exception as e:
+            failed += 1
+            msg = f"{type(e).__name__}: {e}"
+            df.at[idx, "translation_error"] = msg
+            print(f"[ERROR] row={idx} lang={lang} :: {msg}")
+            if "device-side assert" in msg or "CUDA error" in msg:
+                cuda_context_poisoned = True
+                print("[FATAL] CUDA コンテキストが壊れた可能性があります。ここで保存して終了します。ランタイム再起動後、ONLY_EMPTY=True のまま再開してください。")
+                df.to_parquet(OUTPUT_PATH, index=False)
+                write_stats(df, STATS_PATH, len(df), len(work_idx), len(skipped_idx))
+                break
+
+        if i % save_every == 0:
+            df.to_parquet(OUTPUT_PATH, index=False)
+            write_stats(df, STATS_PATH, len(df), len(work_idx), len(skipped_idx))
+            elapsed = time.time() - start_time
+            print(f"saved {i}/{len(work_idx)} rows -> {OUTPUT_PATH} | translated={translated} failed={failed} elapsed={elapsed/60:.1f}m")
+
+    df.to_parquet(OUTPUT_PATH, index=False)
+    elapsed = time.time() - start_time
+    print(f"Done. translated={translated} failed={failed} elapsed={elapsed/60:.1f}m")
+    print(f"Saved: {OUTPUT_PATH}")
+    stats = write_stats(df, STATS_PATH, len(df), len(work_idx), len(skipped_idx))
+    print(json.dumps({k: stats[k] for k in ["translated_nonempty", "failed", "translated_by_lang", "failed_by_lang"]}, ensure_ascii=False, indent=2))
+
+    try:
+        del model
+        del processor
+    except Exception:
+        pass
+    gc.collect()
+
+    if torch.cuda.is_available() and not cuda_context_poisoned:
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print("[WARN] cleanup 時の CUDA キャッシュ解放をスキップ:", e)
+    elif cuda_context_poisoned:
+        print("[INFO] CUDA コンテキスト破損の可能性があるため、最後の empty_cache は呼びませんでした。必要ならランタイムを再起動してください。")
+
+    return df
+```
+
+#### 7-A2a-3) まずは少量スモークテスト（推奨）
+**全部回す前に、各言語から少量ずつ試してください。** 今回のような silent failure は、ここで `translated_nonempty` を見ればすぐ気づけます。
+
+```python
+# 推奨: まず各言語 20 行ずつ（最大 60 行）で確認
+MODEL_ID = "google/translategemma-4b-it"
+BATCH_SIZE = 1
+MAX_NEW_TOKENS = 256
+MAX_ROWS = None
+ONLY_EMPTY = True
+SAVE_EVERY = 20
+CHUNK_CHARS = 900
+QUANTIZE_4BIT = False
+SAMPLE_PER_LANG = 20
+
+_ = run_translategemma_jobs(
+    model_id=MODEL_ID,
+    batch_size=BATCH_SIZE,
+    max_new_tokens=MAX_NEW_TOKENS,
+    max_rows=MAX_ROWS,
+    only_empty=ONLY_EMPTY,
+    save_every=SAVE_EVERY,
+    chunk_chars=CHUNK_CHARS,
+    quantize_4bit=QUANTIZE_4BIT,
+    sample_per_lang=SAMPLE_PER_LANG,
+)
+```
+
+#### 7-A2a-4) デフォルト実行セル：TranslateGemma-4B（全部回す）
+スモークテストで `translated_nonempty` が十分に入り、`failed=0` かごく少数なのを確認してから使ってください。**4B は非量子化・小さめ batch・小さめ chunk** にして、G4/T4 でも落ちにくい寄りの設定にしています。出力先は `artifacts/ocr/translation_jobs_translated.parquet` です。
+
+```python
+# デフォルト: TranslateGemma-4B（全部回す）
+MODEL_ID = "google/translategemma-4b-it"
+BATCH_SIZE = 1          # G4/T4 ではまず 1。安定したら 2 を試す
+MAX_NEW_TOKENS = 256
+MAX_ROWS = None
+ONLY_EMPTY = True       # 途中再開に便利
+SAVE_EVERY = 50
+CHUNK_CHARS = 900
+QUANTIZE_4BIT = False   # 4B はまず非量子化。これがいちばん安定
+SAMPLE_PER_LANG = None  # 全件実行
+
+_ = run_translategemma_jobs(
+    model_id=MODEL_ID,
+    batch_size=BATCH_SIZE,
+    max_new_tokens=MAX_NEW_TOKENS,
+    max_rows=MAX_ROWS,
+    only_empty=ONLY_EMPTY,
+    save_every=SAVE_EVERY,
+    chunk_chars=CHUNK_CHARS,
+    quantize_4bit=QUANTIZE_4BIT,
+    sample_per_lang=SAMPLE_PER_LANG,
+)
+```
+
+#### 7-A2a-5) 高品質版（任意）：TranslateGemma-12B
+4B より高品質を狙う任意版です。**12B は 4bit 量子化前提**にしてあります。G4/T4 ではまだ厳しいことがあるので、まず 4B を通してから使ってください。A100/H100 など高メモリ GPU の方が向いています。
+
+```python
+# 任意: TranslateGemma-12B
+MODEL_ID = "google/translategemma-12b-it"
+BATCH_SIZE = 1
+MAX_NEW_TOKENS = 256
+MAX_ROWS = None
+ONLY_EMPTY = True
+SAVE_EVERY = 20
+CHUNK_CHARS = 700
+QUANTIZE_4BIT = True
+SAMPLE_PER_LANG = None
+
+_ = run_translategemma_jobs(
+    model_id=MODEL_ID,
+    batch_size=BATCH_SIZE,
+    max_new_tokens=MAX_NEW_TOKENS,
+    max_rows=MAX_ROWS,
+    only_empty=ONLY_EMPTY,
+    save_every=SAVE_EVERY,
+    chunk_chars=CHUNK_CHARS,
+    quantize_4bit=QUANTIZE_4BIT,
+    sample_per_lang=SAMPLE_PER_LANG,
+)
+```
+
+#### 7-A2a-6) 翻訳結果と stats の確認
+`translation_en` が埋まり、`translated_nonempty` が増えていれば、そのまま次の `ocr_pairs` セルへ進めます。
+
+```python
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+
+REPO_DIR = Path(os.environ.get("REPO_DIR", "/content/repo/translate-akkadian")).resolve()
+os.chdir(REPO_DIR)
+check_path = REPO_DIR / "artifacts/ocr/translation_jobs_translated.parquet"
+stats_path = REPO_DIR / "artifacts/ocr/translation_jobs_translated.stats.json"
+print(f"REPO_DIR={REPO_DIR}")
+print(f"check_path={check_path}")
+print(f"exists={check_path.exists()}")
+print(f"stats_path={stats_path}")
+print(f"stats_exists={stats_path.exists()}")
+
+if stats_path.exists():
+    stats = json.loads(stats_path.read_text())
+    print(json.dumps(stats, ensure_ascii=False, indent=2)[:4000])
+
+df_check = pd.read_parquet(check_path)
+print(df_check[["lang", "text", "translation_en", "translation_model", "translation_error"]].head(10).to_string())
+print("rows=", len(df_check))
+print("translated_nonempty=", int(df_check["translation_en"].fillna("").str.strip().ne("").sum()))
+print("failed=", int(df_check["translation_error"].fillna("").str.strip().ne("").sum()))
+print(df_check["lang"].value_counts(dropna=False).head(20))
 ```
 
 出力: `artifacts/ocr_pairs/mixed_train.parquet`  
-統計ログ:  
+出力: `artifacts/ocr_pairs/mixed_train.parquet`  
+主な中間生成物:
+- `artifacts/ocr/publications_clean.csv`
+  - `page_text_clean`: 翻訳段落を壊さないクリーニング済み本文
+  - `page_text_translit`: 転写ブロックの確認用列
 - `artifacts/ocr/publications_candidates_stats.json`
+- `artifacts/ocr/translation_jobs.parquet`
+  - `block_hash`, `lang`, `text`, `translation_en`, `translation_prompt` を持つ
+  - `translation_en` を埋めたものを `artifacts/ocr/translation_jobs_translated.parquet` に保存すると `ocr_pairs` が自動で読む
 - `artifacts/ocr_pairs/summary.json`
 - `artifacts/ocr_pairs/mixed_train.stats.json`
+
+確認ポイント:
+- `publications_candidates_stats.json` の `reason_metadata_and_blocks` / `reason_metadata_only` と `translation_lang_*` を見る
+- `translation_jobs.parquet` の件数が多すぎる場合は、まず `fr,de,tr` を優先して英語化する
+- `ocr_pairs/summary.json` の `tranche_counts` と `tgt_lang_counts` を見て、`T3`（非英語→英語化）を何件回収できたか確認する
+- OCR 混合後も val 側には OCR 行を入れない（この README の後段セルはその前提で動きます）
+
+おすすめの Kaggle 試行順:
+- 1本目: `--tranches T1`
+- 2本目: `--tranches T1,T2`
+- 3本目: `--tranches T1,T2,T3`
+- 4本目: `--tranches T1,T2,T3,T4`
+
+`mix_ocr` は `--ratio-by-tranche T1=0.08,T2=0.08,T3=0.04` のように tranche ごとの混合率も指定できます。  
+まずは **良い OCR を広く残し、Kaggle で悪い tranche を塊ごとに抜く**運用を推奨します。
 
 #### 7-A2b) EvaCun 追加データの準備（任意）
 `セル 5-E` で `RUN_EVACUN="1"` にしてから実行してください。

@@ -1,10 +1,9 @@
-"""aligned_train と OCR high tier を混合する。"""
+"""aligned_train と OCR 追加並列を品質優先で混合する。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -81,6 +80,87 @@ def _get_int(cfg: Dict[str, object], key: str, default: int) -> int:
         return default
 
 
+def _quality_sort_columns(df: pd.DataFrame) -> List[str]:
+    candidates = [
+        "tranche_rank",
+        "quality_score",
+        "doc_match_score",
+        "align_score",
+        "metadata_top_score",
+        "token_align_score",
+    ]
+    return [col for col in candidates if col in df.columns]
+
+
+def _dedupe_pairs(df: pd.DataFrame) -> pd.DataFrame:
+    if not {"src_sent", "tgt_sent"}.issubset(df.columns):
+        return df
+    return df.drop_duplicates(subset=["src_sent", "tgt_sent"]).reset_index(drop=True)
+
+
+def _parse_ratio_map(text: str) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for raw in text.split(","):
+        part = raw.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        try:
+            out[key] = float(value.strip())
+        except ValueError:
+            continue
+    return out
+
+
+def _tranche_rank(tranche: str) -> int:
+    order = {"T1": 1, "T2": 2, "T3": 3, "T4": 4, "T5": 5}
+    return order.get(str(tranche or "").upper(), 999)
+
+
+def _quality_select(
+    df: pd.DataFrame,
+    target_n: int,
+    max_per_oare_id: int,
+    max_per_pdf: int,
+) -> pd.DataFrame:
+    if target_n <= 0 or df.empty:
+        return df.head(0).copy()
+
+    df = df.copy()
+    if "tranche" in df.columns:
+        df["tranche_rank"] = df["tranche"].astype(str).map(_tranche_rank)
+    sort_cols = _quality_sort_columns(df)
+    ascending = [True if col == "tranche_rank" else False for col in sort_cols]
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=ascending, kind="mergesort").reset_index(drop=True)
+
+    selected_rows: List[int] = []
+    oare_counter: Counter[str] = Counter()
+    pdf_counter: Counter[str] = Counter()
+
+    for idx, row in df.iterrows():
+        oare_id = str(row.get("oare_id", "") or "")
+        pdf_name = str(row.get("pdf_name", "") or "")
+        if max_per_oare_id > 0 and oare_id and oare_counter[oare_id] >= max_per_oare_id:
+            continue
+        if max_per_pdf > 0 and pdf_name and pdf_counter[pdf_name] >= max_per_pdf:
+            continue
+        selected_rows.append(idx)
+        if oare_id:
+            oare_counter[oare_id] += 1
+        if pdf_name:
+            pdf_counter[pdf_name] += 1
+        if len(selected_rows) >= target_n:
+            break
+
+    if len(selected_rows) < target_n:
+        remaining = [idx for idx in range(len(df)) if idx not in set(selected_rows)]
+        selected_rows.extend(remaining[: max(0, target_n - len(selected_rows))])
+
+    return df.iloc[selected_rows].reset_index(drop=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mix aligned_train with OCR high tier data.")
     parser.add_argument("--config", required=True, help="Config file path.")
@@ -88,10 +168,12 @@ def main() -> None:
     parser.add_argument("--ocr", default=None, help="OCR parts directory or prefix.")
     parser.add_argument("--out", default=None, help="Output path.")
     parser.add_argument("--tiers", default=None, help="Comma separated tiers (default: high).")
+    parser.add_argument("--tranches", default=None, help="Comma separated tranches (T1,T2,...).")
     parser.add_argument("--ratio", type=float, default=None, help="OCR ratio vs baseline.")
+    parser.add_argument("--ratio-by-tranche", default=None, help="Comma separated ratio map, e.g. T1=0.1,T2=0.1.")
     parser.add_argument("--variants", default=None, help="Variants to keep (A,B,C).")
+    parser.add_argument("--source-subtypes", default=None, help="Comma separated OCR source_subtype filter.")
     parser.add_argument("--disable-ocr", action="store_true", help="Disable OCR mixing.")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -122,11 +204,18 @@ def main() -> None:
 
     tiers = args.tiers or str(cfg.get("ocr_mix_quality_tiers", "high"))
     tier_set = {t.strip().lower() for t in tiers.split(",") if t.strip()}
+    tranches = args.tranches or str(cfg.get("ocr_mix_tranches", ""))
+    tranche_set = {t.strip().upper() for t in tranches.split(",") if t.strip()}
+    ratio_by_tranche = _parse_ratio_map(
+        args.ratio_by_tranche or str(cfg.get("ocr_mix_ratio_by_tranche", ""))
+    )
     variants = args.variants or str(cfg.get("ocr_mix_variants", ""))
     variant_set = {v.strip().upper() for v in variants.split(",") if v.strip()}
+    source_subtypes = args.source_subtypes or str(cfg.get("ocr_mix_source_subtypes", ""))
+    source_subtype_set = {v.strip() for v in source_subtypes.split(",") if v.strip()}
 
-    seed = args.seed if args.seed is not None else _get_int(cfg, "seed", 42)
-    rng = random.Random(seed)
+    max_per_oare_id = _get_int(cfg, "ocr_mix_max_per_oare_id", 6)
+    max_per_pdf = _get_int(cfg, "ocr_mix_max_per_pdf", 20)
 
     aligned_df = read_table(aligned_path)
     if variant_set and "src_norm_variant" in aligned_df.columns:
@@ -149,57 +238,76 @@ def main() -> None:
     if not ocr_parts:
         raise FileNotFoundError(f"OCR parts not found at: {ocr_path}")
 
-    target_n = int(round(len(aligned_df) * ratio))
-    target_n = max(target_n, 0)
-
-    sample_rows: List[Dict[str, object]] = []
-    ocr_columns: Optional[List[str]] = None
-    seen = 0
+    ocr_frames: List[pd.DataFrame] = []
     tier_counts: Counter[str] = Counter()
-
+    tranche_counts_total: Counter[str] = Counter()
+    tranche_counts_selected: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    subtype_counts_total: Counter[str] = Counter()
+    subtype_counts_selected: Counter[str] = Counter()
     for part_path in ocr_parts:
         df = pd.read_parquet(part_path)
         if "quality_tier" in df.columns and tier_set:
-            df = df[df["quality_tier"].str.lower().isin(tier_set)]
+            df = df[df["quality_tier"].fillna("").astype(str).str.lower().isin(tier_set)]
+        if tranche_set and "tranche" in df.columns:
+            df = df[df["tranche"].fillna("").astype(str).str.upper().isin(tranche_set)]
         if variant_set and "src_norm_variant" in df.columns:
             df = df[df["src_norm_variant"].isin(variant_set)]
-
+        if source_subtype_set and "source_subtype" in df.columns:
+            df = df[df["source_subtype"].fillna("").astype(str).isin(source_subtype_set)]
         if df.empty:
             continue
-
+        df = _dedupe_pairs(df)
+        ocr_frames.append(df)
         if "quality_tier" in df.columns:
             tier_counts.update(df["quality_tier"].fillna("").astype(str).str.lower().tolist())
+        if "tranche" in df.columns:
+            tranche_counts_total.update(df["tranche"].fillna("").astype(str).str.upper().tolist())
+        if "candidate_reason" in df.columns:
+            reason_counts.update(df["candidate_reason"].fillna("").astype(str).tolist())
+        if "source_subtype" in df.columns:
+            subtype_counts_total.update(df["source_subtype"].fillna("").astype(str).tolist())
 
-        if ocr_columns is None:
-            ocr_columns = list(df.columns)
-        else:
-            for col in ocr_columns:
-                if col not in df.columns:
-                    df[col] = None
-            df = df[ocr_columns]
-
-        for row in df.itertuples(index=False):
-            seen += 1
-            row_dict = row._asdict()
-            if len(sample_rows) < target_n:
-                sample_rows.append(row_dict)
-            else:
-                if target_n == 0:
-                    break
-                idx = rng.randrange(seen)
-                if idx < target_n:
-                    sample_rows[idx] = row_dict
-
-    if target_n == 0:
-        ocr_sample = pd.DataFrame(columns=ocr_columns or [])
+    if ocr_frames:
+        ocr_all = pd.concat(ocr_frames, ignore_index=True)
     else:
-        ocr_sample = pd.DataFrame(sample_rows)
+        ocr_all = pd.DataFrame()
 
-    if not ocr_sample.empty:
-        ocr_sample = ocr_sample.copy()
-        ocr_sample["source"] = "ocr"
+    target_n = max(int(round(len(aligned_df) * ratio)), 0)
+    if not ocr_all.empty:
+        ocr_all = ocr_all.copy()
+        ocr_all["source"] = "ocr"
+        if ratio_by_tranche and "tranche" in ocr_all.columns:
+            tranche_frames: List[pd.DataFrame] = []
+            for tranche, tranche_ratio in ratio_by_tranche.items():
+                tranche_df = ocr_all[ocr_all["tranche"].fillna("").astype(str).str.upper() == tranche.upper()].reset_index(drop=True)
+                if tranche_df.empty:
+                    continue
+                tranche_target_n = max(int(round(len(aligned_df) * tranche_ratio)), 0)
+                if tranche_target_n <= 0:
+                    continue
+                selected = _quality_select(
+                    tranche_df,
+                    tranche_target_n,
+                    max_per_oare_id=max_per_oare_id,
+                    max_per_pdf=max_per_pdf,
+                )
+                tranche_frames.append(selected)
+                if "tranche" in selected.columns:
+                    tranche_counts_selected.update(selected["tranche"].fillna("").astype(str).str.upper().tolist())
+                if "source_subtype" in selected.columns:
+                    subtype_counts_selected.update(selected["source_subtype"].fillna("").astype(str).tolist())
+            ocr_sample = pd.concat(tranche_frames, ignore_index=True) if tranche_frames else pd.DataFrame()
+            ocr_sample = _dedupe_pairs(ocr_sample)
+        else:
+            ocr_sample = _quality_select(ocr_all, target_n, max_per_oare_id=max_per_oare_id, max_per_pdf=max_per_pdf)
+            if "tranche" in ocr_sample.columns:
+                tranche_counts_selected.update(ocr_sample["tranche"].fillna("").astype(str).str.upper().tolist())
+            if "source_subtype" in ocr_sample.columns:
+                subtype_counts_selected.update(ocr_sample["source_subtype"].fillna("").astype(str).tolist())
+    else:
+        ocr_sample = pd.DataFrame()
 
-    # 列を揃える
     all_cols = sorted(set(aligned_df.columns).union(set(ocr_sample.columns)))
     for col in all_cols:
         if col not in aligned_df.columns:
@@ -215,13 +323,23 @@ def main() -> None:
     else:
         mixed_df.to_csv(out_path, index=False)
 
-    # ガードレール用の簡易統計
     stats = {
         "aligned_rows": int(len(aligned_df)),
-        "ocr_rows": int(len(ocr_sample)),
+        "ocr_rows_total": int(len(ocr_all)),
+        "ocr_rows_selected": int(len(ocr_sample)),
         "mix_rows": int(len(mixed_df)),
         "ocr_ratio": ratio,
+        "ratio_by_tranche": ratio_by_tranche,
+        "max_per_oare_id": max_per_oare_id,
+        "max_per_pdf": max_per_pdf,
         "tier_counts": dict(tier_counts),
+        "tranche_counts_total": dict(tranche_counts_total),
+        "tranche_counts_selected": dict(tranche_counts_selected),
+        "candidate_reason_counts": dict(reason_counts),
+        "source_subtype_total": dict(subtype_counts_total),
+        "source_subtype_selected": dict(subtype_counts_selected),
+        "tranche_filter": sorted(tranche_set),
+        "source_subtype_filter": sorted(source_subtype_set),
         "aligned_gap_rate": compute_gap_rate(aligned_df.get("src_sent", [])),
         "ocr_gap_rate": compute_gap_rate(ocr_sample.get("src_sent", [])),
         "aligned_caps_rate": compute_caps_token_rate(aligned_df.get("src_sent", [])),
@@ -235,7 +353,8 @@ def main() -> None:
     stats_path.write_text(json.dumps(stats, indent=2, ensure_ascii=False))
 
     print(f"Aligned rows: {len(aligned_df)}")
-    print(f"OCR rows: {len(ocr_sample)}")
+    print(f"OCR rows total: {len(ocr_all)}")
+    print(f"OCR rows selected: {len(ocr_sample)}")
     print(f"Output: {out_path}")
     print(f"Stats: {stats_path}")
 
