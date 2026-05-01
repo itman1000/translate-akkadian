@@ -1,16 +1,63 @@
-# venv
+# 仮想環境
 .venv/
 venv/
+env/
 
-# python
+# Python キャッシュ
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# mac
+# macOS
 .DS_Store
 
-# outputs (必要なら)
+# ローカル設定・認証情報
+.env
+.env.*
+.kaggle/
+kaggle.json
+
+# 入力データ
+data/
+
+# 学習・推論の生成物
+artifacts/
+models/
+checkpoints/
+runs/
+wandb/
+logs/
 tmp/
-# local bundles
+
+# 提出・予測ファイル
+submission*.csv
+predictions.csv
+val_predictions.csv
+
+# モデル・中間データ
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.pkl
+*.pickle
+*.parquet
+*.feather
+*.zip
+
+# notebook キャッシュ
+.ipynb_checkpoints/
+
+# ローカルに作る配布用 bundle
 kaggle_bundle/
 llm_bundle/
+
+# 手元で保存した外部ページ
+Oracc/
+Oracc.html
