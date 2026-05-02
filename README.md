@@ -45,27 +45,6 @@ pip install -r requirements.txt
 
 `data/` は Git 管理対象外です。GitHub にはコンペ入力データやローカルで作成した派生データを含めず、実行する環境ごとに配置してください。
 
-## Git 管理対象外のファイル
-このリポジトリでは、GitHub に push しないファイルを `.gitignore` で除外しています。
-
-- `.venv/`: ローカル仮想環境
-- `data/`: Kaggle の入力 CSV や追加データ
-- `artifacts/`: 学習・評価・推論で生成される中間成果物
-- `models/`, `checkpoints/`: 学習済みモデルやダウンロード済みモデル
-- `submission*.csv`, `predictions.csv`: 提出ファイル・予測ファイル
-- `.env`, `.kaggle/`, `kaggle.json`: 認証情報やローカル設定
-
-すでに Git に追加してしまった生成物を外す場合は、ファイル自体を消さずに index からだけ外します。
-
-```bash
-git rm -r --cached .venv data artifacts models
-git rm --cached submission*.csv predictions.csv
-git add .gitignore README.md
-git commit -m "Git管理対象外のファイルを整理"
-```
-
-過去 commit に含めたくないファイルがある状態で未 push の場合は、通常の commit 追加だけでは履歴に残ります。GitHub に公開する前に履歴を書き換えるか、公開用の clean な履歴を作ってから push してください。
-
 ## データ品質方針
 間違ったデータで学習するくらいなら、そのデータで学習しないことを最優先にします。
 
